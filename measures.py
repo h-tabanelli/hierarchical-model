@@ -189,6 +189,7 @@ def corr_second_layer_scalar(s_hat: torch.Tensor, s_true: torch.Tensor) -> float
 ### Plot functions ###
 
 def savefig(path):
+    import matplotlib.pyplot as plt
     os.makedirs(os.path.dirname(path), exist_ok=True)
     plt.tight_layout()
     plt.savefig(path, dpi=170)
