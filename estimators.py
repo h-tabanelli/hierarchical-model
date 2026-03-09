@@ -287,21 +287,117 @@ def full_eigs_from_stream_if_small(stream_fn_factory, m: int, n_total: int, devi
     return evals
 
 
+# @torch.no_grad()
+# def top_p_eigmats_of_C(stream_fn_factory, d, n_total, p, n_iter=5, oversamp=3, device=None, input_mode='true'):
+#     if device is None:
+#         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+#     k = p + oversamp
+#     Q = torch.randn(k, d, d, device=device)
+#     Q = frob_orthonormalize(Q)
+
+#     for _ in range(n_iter):
+#         CQ = C_apply(stream_fn_factory(), Q, d=d, n_total=n_total, device=device, input_mode=input_mode)
+#         Q = frob_orthonormalize(CQ.to(dtype=torch.float32))
+
+#     # return first p directions (already orthonormal)
+#     return Q[:p]
+
 @torch.no_grad()
-def top_p_eigmats_of_C(stream_fn_factory, d, n_total, p, n_iter=5, oversamp=3, device=None, input_mode='true'):
+def top_p_eigmats_of_C(
+    stream_fn_factory,
+    d,
+    n_total,
+    p,
+    n_iter=5,
+    oversamp=3,
+    device=None,
+    input_mode='true',
+    Q_init=None,
+    T_min=0,
+    stop_tol=None,
+    return_Q_full=False,
+    return_info=False,
+):
+    """Estimate top-p eigen-matrices of the empirical operator C using (subspace) power iteration.
+
+    IMPORTANT:
+      - This routine is *operator-only*: it never forms C explicitly.
+      - Each iteration calls C_apply(...) which streams over n_total samples.
+
+    Added features (backwards compatible):
+      - warm start via Q_init
+      - early stopping on the *iterations* (never on samples) via (T_min, stop_tol)
+
+    Returns:
+      - default: Q[:p] of shape (p,d,d)
+      - if return_Q_full: also returns Q_full of shape (k,d,d)
+      - if return_info: also returns info dict with n_iter_effective and stop_delta
+    """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    k = p + oversamp
-    Q = torch.randn(k, d, d, device=device)
-    Q = frob_orthonormalize(Q)
+    k = int(p) + int(oversamp)
+    d = int(d)
+    p = int(p)
+    T_max = int(n_iter)
+    T_min = int(T_min)
 
-    for _ in range(n_iter):
+    # --- init subspace ---
+    if Q_init is None:
+        Q = torch.randn(k, d, d, device=device, dtype=torch.float32)
+    else:
+        Q0 = sym(Q_init.to(device=device, dtype=torch.float32))
+        if Q0.dim() != 3 or Q0.shape[1] != d or Q0.shape[2] != d:
+            raise ValueError(f"Q_init must have shape (k,d,d) with d={d}. Got {tuple(Q0.shape)}")
+        if Q0.shape[0] < k:
+            pad = torch.randn(k - Q0.shape[0], d, d, device=device, dtype=torch.float32)
+            Q = torch.cat([Q0, pad], dim=0)
+        else:
+            Q = Q0[:k]
+
+    Q = frob_orthonormalize(Q)  # (k,d,d) float32
+
+    # --- early stop bookkeeping (subspace change between iterates) ---
+    prev_Qp_flat = None
+    last_delta = None
+    n_iter_effective = 0
+
+    for t in range(T_max):
         CQ = C_apply(stream_fn_factory(), Q, d=d, n_total=n_total, device=device, input_mode=input_mode)
         Q = frob_orthonormalize(CQ.to(dtype=torch.float32))
+        n_iter_effective = t + 1
 
-    # return first p directions (already orthonormal)
-    return Q[:p]
+        if stop_tol is not None:
+            # Compare p-dim subspaces spanned by current and previous iterates.
+            Qp_flat = Q[:p].reshape(p, d * d).to(torch.float64)
+            if prev_Qp_flat is not None:
+                # Both bases are Frobenius-orthonormal => dot products form a p×p matrix.
+                M = Qp_flat @ prev_Qp_flat.T  # (p,p)
+                I = torch.eye(p, device=M.device, dtype=M.dtype)
+                delta = torch.linalg.norm(I - (M @ M.T), ord='fro').item()
+                last_delta = float(delta)
+                if (t + 1) >= max(T_min, 1) and delta < float(stop_tol):
+                    break
+            prev_Qp_flat = Qp_flat.detach()
+
+    out_Qp = Q[:p]
+    info = {
+        "n_iter_effective": int(n_iter_effective),
+        "stop_delta": None if last_delta is None else float(last_delta),
+        "T_max": int(T_max),
+        "T_min": int(T_min),
+        "stop_tol": None if stop_tol is None else float(stop_tol),
+        "k": int(k),
+    }
+
+    if not return_Q_full and not return_info:
+        return out_Qp
+    if return_Q_full and not return_info:
+        return out_Qp, Q
+    if (not return_Q_full) and return_info:
+        return out_Qp, info
+    return out_Qp, Q, info
 
 @torch.no_grad()
 def compute_hhat_from_X_and_Ahat(X, Ahat):

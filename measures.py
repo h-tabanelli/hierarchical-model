@@ -1,7 +1,6 @@
 import math
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
 import os, json, time
 
 ### Overlaps definition ###
@@ -135,6 +134,57 @@ def B_conjugation_invariant_distance(Bhat, Btrue):
     rel = np.linalg.norm(diff) / (np.linalg.norm(eig_t) + 1e-12)
     return float(rel)
 
+# =========================
+# B-metrics (rotation-invariant)
+# =========================
+
+import torch
+
+
+@torch.no_grad()
+def spectrum_metrics_B(B_hat: torch.Tensor, B_true: torch.Tensor) -> dict:
+    """Rotation-invariant comparison of B matrices via eigenvalues, up to global scaling.
+
+    Returns:
+      - c_opt: best L2 scaling minimizing ||c*lam_hat - lam_true||_2
+      - eig_err_B: relative L2 error on spectra after scaling
+      - eig_corr_B: centered correlation between spectra
+    """
+    B_hat = (B_hat + B_hat.T) / 2
+    B_true = (B_true + B_true.T) / 2
+
+    lam_hat = torch.linalg.eigvalsh(B_hat.to(dtype=torch.float64, device="cpu"))
+    lam_true = torch.linalg.eigvalsh(B_true.to(dtype=torch.float64, device="cpu"))
+
+    den = (lam_hat @ lam_hat).item()
+    c_opt = 0.0 if den < 1e-30 else float((lam_true @ lam_hat).item() / den)
+
+    eig_err_B = float(
+        torch.linalg.norm(c_opt * lam_hat - lam_true).item()
+        / (torch.linalg.norm(lam_true).item() + 1e-12)
+    )
+
+    lam_hat_c = lam_hat - lam_hat.mean()
+    lam_true_c = lam_true - lam_true.mean()
+    eig_corr_B = float(
+        (lam_hat_c @ lam_true_c).item()
+        / ((torch.linalg.norm(lam_hat_c).item() + 1e-12) * (torch.linalg.norm(lam_true_c).item() + 1e-12))
+    )
+
+    return {"c_opt_B": float(c_opt), "eig_err_B": eig_err_B, "eig_corr_B": eig_corr_B}
+
+
+@torch.no_grad()
+def corr_second_layer_scalar(s_hat: torch.Tensor, s_true: torch.Tensor) -> float:
+    """Correlation-style score for 2nd-layer scalar preactivation s(x).
+    Expects shape (n,) or (n,1).
+    """
+    if s_hat.dim() == 1:
+        s_hat = s_hat[:, None]
+    if s_true.dim() == 1:
+        s_true = s_true[:, None]
+    return float(feature_overlap_corr_invariant(s_hat, s_true))
+
 
 ### Plot functions ###
 
@@ -148,6 +198,7 @@ def plot_hist_flat(H, title, path, bins=80):
     """
     Histogramme des entries H_{mu,i} aplaties.
     """
+    import matplotlib.pyplot as plt
     z = np.asarray(H).reshape(-1)
     plt.figure()
     plt.hist(z, bins=bins, density=True)
@@ -157,6 +208,7 @@ def plot_hist_flat(H, title, path, bins=80):
     savefig(path)
 
 def plot_cov_diag(H, title, path):
+    import matplotlib.pyplot as plt
     H = np.asarray(H)
     Hc = H - H.mean(axis=0, keepdims=True)
     cov = (Hc.T @ Hc) / Hc.shape[0]
@@ -169,6 +221,7 @@ def plot_cov_diag(H, title, path):
     savefig(path)
 
 def plot_cov_spectrum(H, title, path):
+    import matplotlib.pyplot as plt
     """
     Spectre de la covariance empirique de H.
     """
@@ -215,6 +268,8 @@ def hist_from_density(grid, density, bins=80):
     return centers, heights, edges
 
 def plot_density_and_hist(grid, density, title="", bins=80):
+    import matplotlib.pyplot as plt
+
     centers, heights, edges = hist_from_density(grid, density, bins=bins)
 
     plt.figure(figsize=(7,4))
@@ -228,11 +283,8 @@ def plot_density_and_hist(grid, density, title="", bins=80):
     plt.tight_layout()
     plt.show()
 
-
-import numpy as np
-import matplotlib.pyplot as plt
-
 def plot_full_spectrum(evals, title, path, bins=120, logy=False):
+    import matplotlib.pyplot as plt
     plt.figure()
     plt.hist(evals, bins=bins)
     if logy:
@@ -245,6 +297,7 @@ def plot_full_spectrum(evals, title, path, bins=120, logy=False):
     plt.close()
 
 def plot_full_spectrum_with_top(evals, title, path, k_top=40, bins=120):
+    import matplotlib.pyplot as plt
     evals = np.asarray(evals)
     plt.figure(figsize=(7,4))
     plt.hist(evals, bins=bins, alpha=0.8)
@@ -265,6 +318,7 @@ def plot_full_spectrum_with_top(evals, title, path, k_top=40, bins=120):
 
 
 def plot_with_errorbars(x, mean, std, xlabel, ylabel, title, path, logy=False, marker='o', color='C0'):
+    import matplotlib.pyplot as plt
     """
     Simple plot with mean and errorbars (std). Saves figure to `path`.
     `x`, `mean`, `std` can be lists or numpy arrays.
@@ -352,7 +406,6 @@ def save_results_json(results, path):
     print(f"Saved {path}")
 
 def plot_full_spectrum_with_top_abs(evals, title, path, k_top=40, bins=120):
-    import numpy as np
     import matplotlib.pyplot as plt
 
     # --- robust conversion ---

@@ -1,0 +1,34 @@
+{
+  "task": {
+    "exp_id": "SMOKE2",
+    "chunk_id": 0,
+    "d": 40,
+    "eps": 0.5,
+    "alphas": [
+      1.0,
+      1.2,
+      1.4,
+      1.6,
+      1.8
+    ],
+    "seed": 0,
+    "beta": 1.0,
+    "batch_size": 256,
+    "n_test": 256,
+    "A_mode_teacher": "sym_orth_frob",
+    "B_mode": "dense",
+    "gamma": 0.0,
+    "models": [
+      "true"
+    ],
+    "g_name": "id",
+    "n_iter_C_max": 12,
+    "oversamp_C": 3,
+    "T_min": 4,
+    "stop_tol": 0.001,
+    "fit_degree": 5,
+    "fit_ridge": 1e-06
+  },
+  "started_utc": "2026-03-09T17:54:53Z",
+  "device": "cpu"
+}

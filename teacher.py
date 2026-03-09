@@ -55,14 +55,14 @@ def gen_B_symmetric_dense_torch(p, gen, device, beta=None):
 def gen_B_powerlaw_diag_torch(p, gen, device, beta=None, gamma=0.0, rademacher=True, eps=1e-12):
     """
     Diagonal power-law prior:
-      B = diag( b_i ),  b_i = (beta/p) * z_i * i^{-2*gamma}
+      B = diag( b_i ),  b_i = (beta/p) * z_i * i^{-gamma}
     where z_i are Rademacher (+/-1) if rademacher else all +1.
     """
     if beta is None:
         beta = DEFAULT_BETA
 
     idx = torch.arange(1, p+1, device=device, dtype=torch.float32)  # 1..p
-    w = idx.pow(-2.0 * float(gamma))  # i^{-2gamma}
+    w = idx.pow(-1.0 * float(gamma))  # i^{-2gamma}
 
     if rademacher:
         z = torch.randint(0, 2, (p,), generator=gen, device=device, dtype=torch.int64)
@@ -72,8 +72,12 @@ def gen_B_powerlaw_diag_torch(p, gen, device, beta=None, gamma=0.0, rademacher=T
 
     b = z * w
     # scale comparable to dense case
-    b = (beta / p) * b
-
+    if gamma==0.0:
+        b = (beta / p) * b
+    elif 0 < gamma <= 1/2:
+        b = p**(2*gamma - 1.0) * b
+    elif 1/2 < gamma:
+        b = beta * b
     return torch.diag(b)
 
 def compute_h_from_X_torch(X, A_teacher):
