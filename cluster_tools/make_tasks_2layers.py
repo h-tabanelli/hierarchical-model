@@ -81,6 +81,7 @@ def main() -> None:
     ap.add_argument("--B_mode", type=str, default="powerlaw_diag")
     ap.add_argument("--gamma", type=float, default=0.25)
     ap.add_argument("--g_name", type=str, default="id")
+    ap.add_argument("--save_estimates", action="store_true", help="Save Ahat/Bhat per alpha for posthoc analysis")
 
     ap.add_argument("--n_iter_C_max", type=int, default=15)
     ap.add_argument("--oversamp_C", type=int, default=10)
@@ -119,6 +120,7 @@ def main() -> None:
                 "A_mode_teacher": args.A_mode_teacher,
                 "B_mode": args.B_mode,
                 "gamma": float(args.gamma),
+                "save_estimates": bool(args.save_estimates),
                 "models": models,
                 "g_name": args.g_name,
                 "n_iter_C_max": int(args.n_iter_C_max),

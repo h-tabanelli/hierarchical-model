@@ -94,6 +94,8 @@ def _run_one_alpha_model(
     Q_init: torch.Tensor | None,
     device: torch.device,
     Xte: torch.Tensor,
+    jobdir: Path, 
+    save_estimates: bool = False,
 ) -> tuple[dict, torch.Tensor | None]:
     """Run a single (alpha, model) and return (metrics_dict, Q_full_for_warm_start)."""
     t0 = time.time()
@@ -173,6 +175,22 @@ def _run_one_alpha_model(
         Bhat_cpu = estimators.estimate_Bhat_from_H_stream(
             stream_fn=Hhat_stream, p=p, n_total=n, device=device
         )
+
+    # ---- Optional: save estimates for posthoc analysis ----
+    if save_estimates:
+        artdir = jobdir / "artifacts" / f"alpha={alpha:.4f}" / f"model={model}"
+        artdir.mkdir(parents=True, exist_ok=True)
+
+        payload = {
+            "alpha": float(alpha),
+            "d": int(d),
+            "p": int(p),
+            "seed": int(seed),
+            "model": str(model),
+            "Ahat": Ahat.detach().to(device="cpu", dtype=torch.float16),
+            "Bhat": Bhat_cpu.detach().to(device="cpu", dtype=torch.float16),
+        }
+        torch.save(payload, artdir / "estimates.pt")
 
     # ---- calibration / link ----
     if is_id:
@@ -389,7 +407,8 @@ def main() -> None:
                     n_iter_C_max=n_iter_C_max, oversamp_C=oversamp_C,
                     T_min=T_min, stop_tol=stop_tol,
                     Q_init=Q_state[model],
-                    device=device, Xte=Xte
+                    device=device, Xte=Xte,
+                    jobdir=jobdir, save_estimates=task.get("save_estimates", False),
                 )
 
                 if Q_full is not None:

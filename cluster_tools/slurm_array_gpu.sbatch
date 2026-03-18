@@ -11,10 +11,16 @@
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 
+# Load the same modules you used to create the venv
+module load gcc python py-virtualenv
+
+# Activate venv so numpy/torch/etc are available
+source ~/venvs/hgm/bin/activate
+
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 
 python3 cluster_tools/run_task_2layers.py \
-  --taskfile tasks.jsonl \
+  --taskfile runs/D400_eps05_g00_v2/tasks.jsonl \
   --task_id ${SLURM_ARRAY_TASK_ID} \
   --outdir results

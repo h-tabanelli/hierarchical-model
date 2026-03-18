@@ -1,7 +1,30 @@
+# Python
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
 .DS_Store
+
+# Envs
+.venv/
+venv/
+venvs/
+
+# Cluster outputs / runs
 results/
+runs/
 logs/
+summary/
+figures/
+
+# Artifacts/binaries
+*.pt
+*.pth
+*.parquet
+*.npz
+
+# Task files
 tasks*.jsonl
+tasks*.json
+
+# Optional: PDFs / exports
+*.pdf
