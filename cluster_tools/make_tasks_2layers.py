@@ -90,6 +90,16 @@ def main() -> None:
 
     ap.add_argument("--fit_degree", type=int, default=5)
     ap.add_argument("--fit_ridge", type=float, default=1e-6)
+    ap.add_argument("--head_mode", type=str, default="spectral_B", choices=["spectral_B", "latent_rbf", "input_rbf"])
+    ap.add_argument("--n_krr_max", type=int, default=4000)
+    ap.add_argument("--rbf_lambda", type=float, default=1e-4)
+    ap.add_argument("--rbf_sigma_mult", type=float, default=1.0)
+    ap.add_argument("--rbf_standardize", action="store_true", default=True)
+    ap.add_argument("--no_rbf_standardize", dest="rbf_standardize", action="store_false")
+    ap.add_argument("--poly_lambda", type=float, default=1e-4)
+    ap.add_argument("--m_rf", type=int, default=1024)
+
+    ap.add_argument("--load_ahat_exp_id", type=str, default="")
 
     args = ap.parse_args()
 
@@ -126,9 +136,17 @@ def main() -> None:
                 "n_iter_C_max": int(args.n_iter_C_max),
                 "oversamp_C": int(args.oversamp_C),
                 "T_min": int(args.T_min),
-                "stop_tol": stop_tol,  # can be None
+                "stop_tol": stop_tol,
                 "fit_degree": int(args.fit_degree),
                 "fit_ridge": float(args.fit_ridge),
+                "head_mode": str(args.head_mode),
+                "n_krr_max": int(args.n_krr_max),
+                "rbf_lambda": float(args.rbf_lambda),
+                "rbf_sigma_mult": float(args.rbf_sigma_mult),
+                "rbf_standardize": bool(args.rbf_standardize),
+                "poly_lambda": float(args.poly_lambda),
+                "m_rf": int(args.m_rf),
+                "load_ahat_exp_id": None if args.load_ahat_exp_id == "" else str(args.load_ahat_exp_id),
             }
             lines.append(json.dumps(task))
             chunk_id += 1

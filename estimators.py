@@ -561,6 +561,244 @@ def predict_polynomial_link(y0, coeffs, mu_sig=None):
         xp *= y0
     return y
 
+    
+@torch.no_grad()
+def collect_representation_train_from_stream(
+    stream_fn_factory,
+    representation: str,
+    n_keep,
+    model: str,
+    Ahat=None,
+    device=None,
+    dtype=torch.float32,
+):
+    """
+    Collect a train set (Phi_train, y_train) from the normalized stream.
+
+    representation:
+      - 'x'  : observable input (X in true mode, Z in gauss mode)
+      - 'h1' : estimated first-layer features \hat h^{(1)}
+
+    n_keep:
+      - positive int  -> keep at most n_keep samples
+      - None or <= 0  -> keep the FULL stream (no cap)
+
+    Returns CPU float32 tensors.
+    """
+    representation = str(representation)
+    if representation not in {"x", "h1"}:
+        raise ValueError(f"Unknown representation={representation}")
+    if representation == "h1" and Ahat is None:
+        raise ValueError("Ahat must be provided when representation='h1'")
+
+    if device is None:
+        if Ahat is not None:
+            device = Ahat.device
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    use_full_stream = (n_keep is None) or (int(n_keep) <= 0)
+    if not use_full_stream:
+        n_keep = int(n_keep)
+
+    Ahat_dev = None
+    Ahat_flat = None
+    if representation == "h1":
+        Ahat_dev = Ahat.to(device=device, dtype=dtype)
+        if model == "gauss":
+            Ahat_flat = teacher.flatten_A_sym_for_H2_feature(Ahat_dev).to(device=device, dtype=dtype)
+
+    Phi_chunks, y_chunks = [], []
+    kept = 0
+
+    for X_or_Z, y in stream_fn_factory()():
+        X_or_Z = X_or_Z.to(device=device, dtype=dtype)
+        y = y.to(device=device, dtype=dtype)
+
+        if representation == "x":
+            Phi = X_or_Z
+        else:
+            if model == "true":
+                Phi = compute_hhat_from_X_and_Ahat(X_or_Z, Ahat_dev)
+            else:
+                Phi = X_or_Z @ Ahat_flat.T
+
+        if use_full_stream:
+            Phi_chunks.append(Phi.detach().cpu())
+            y_chunks.append(y.detach().cpu())
+            kept += Phi.shape[0]
+            continue
+
+        take = min(Phi.shape[0], n_keep - kept)
+        if take <= 0:
+            break
+
+        Phi_chunks.append(Phi[:take].detach().cpu())
+        y_chunks.append(y[:take].detach().cpu())
+        kept += take
+
+        if kept >= n_keep:
+            break
+
+    if kept == 0:
+        raise RuntimeError("No samples were collected for RBF-KRR")
+
+    Phi_train = torch.cat(Phi_chunks, dim=0).to(torch.float32)
+    y_train = torch.cat(y_chunks, dim=0).to(torch.float32)
+    return Phi_train, y_train
+
+@torch.no_grad()
+def build_test_representation(
+    X_or_Z_test,
+    representation: str,
+    model: str,
+    Ahat=None,
+    device=None,
+    dtype=torch.float32,
+):
+    """
+    Build Phi_test on CPU float32 from a test observable X_or_Z_test.
+    """
+    representation = str(representation)
+    if representation not in {"x", "h1"}:
+        raise ValueError(f"Unknown representation={representation}")
+    if representation == 'h1' and Ahat is None:
+        raise ValueError("Ahat must be provided when representation='h1'")
+
+    if device is None:
+        if Ahat is not None:
+            device = Ahat.device
+        elif hasattr(X_or_Z_test, 'device'):
+            device = X_or_Z_test.device
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    X_or_Z_test = X_or_Z_test.to(device=device, dtype=dtype)
+    if representation == 'x':
+        return X_or_Z_test.detach().cpu().to(torch.float32)
+
+    Ahat_dev = Ahat.to(device=device, dtype=dtype)
+    if model == 'true':
+        Phi_test = compute_hhat_from_X_and_Ahat(X_or_Z_test, Ahat_dev)
+    else:
+        Ahat_flat = teacher.flatten_A_sym_for_H2_feature(Ahat_dev).to(device=device, dtype=dtype)
+        Phi_test = X_or_Z_test @ Ahat_flat.T
+    return Phi_test.detach().cpu().to(torch.float32)
+
+
+@torch.no_grad()
+def standardize_features_train_test(Phi_train, Phi_test, eps=1e-6):
+    """
+    Standardize each coordinate using train-set mean/std.
+    Returns standardized train/test plus the train statistics.
+    """
+    Phi_train = Phi_train.to(torch.float32)
+    Phi_test = Phi_test.to(torch.float32)
+
+    mu = Phi_train.mean(dim=0, keepdim=True)
+    std = Phi_train.std(dim=0, unbiased=False, keepdim=True)
+    std = torch.clamp(std, min=float(eps))
+
+    Phi_train_std = (Phi_train - mu) / std
+    Phi_test_std = (Phi_test - mu) / std
+    return Phi_train_std, Phi_test_std, mu, std
+
+
+@torch.no_grad()
+def median_heuristic_sigma(Phi_train, max_points=2000):
+    """
+    Classical median heuristic for RBF kernels:
+      sigma = sqrt( median_{i<j} ||x_i - x_j||^2 )
+    computed on a subsample when n is large.
+    """
+    Phi_train = Phi_train.to(torch.float32)
+    n = int(Phi_train.shape[0])
+    if n <= 1:
+        return 1.0
+
+    if n > int(max_points):
+        idx = torch.randperm(n)[: int(max_points)]
+        X = Phi_train[idx]
+    else:
+        X = Phi_train
+
+    d2 = torch.cdist(X, X, p=2) ** 2
+    iu = torch.triu_indices(d2.shape[0], d2.shape[1], offset=1)
+    vals = d2[iu[0], iu[1]]
+    vals = vals[torch.isfinite(vals)]
+    if vals.numel() == 0:
+        return 1.0
+
+    med = torch.median(vals).item()
+    return float(max(med, 1e-12) ** 0.5)
+
+
+@torch.no_grad()
+def rbf_kernel(X1, X2, sigma: float):
+    sigma = float(max(sigma, 1e-12))
+    d2 = torch.cdist(X1, X2, p=2) ** 2
+    return torch.exp(-d2 / (2.0 * sigma * sigma))
+
+
+@torch.no_grad()
+def fit_rbf_krr(
+    Phi_train,
+    y_train,
+    sigma=None,
+    lam: float = 1e-4,
+    sigma_mult: float = 1.0,
+    device=None,
+):
+    """
+    Exact kernel ridge regression with an RBF kernel:
+      alpha = (K + lam * n I)^{-1} y
+    Stores the train features and dual coefficients on CPU.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    Phi_train = Phi_train.to(device=device, dtype=torch.float32)
+    y_train = y_train.to(device=device, dtype=torch.float32).reshape(-1)
+    n = int(Phi_train.shape[0])
+    if n != int(y_train.shape[0]):
+        raise ValueError(f"Mismatched sizes: {Phi_train.shape[0]} train points vs {y_train.shape[0]} labels")
+
+    sigma_base = float(median_heuristic_sigma(Phi_train.detach().cpu())) if sigma is None else float(sigma)
+    sigma_eff = float(max(1e-8, float(sigma_mult) * sigma_base))
+
+    K = rbf_kernel(Phi_train, Phi_train, sigma_eff)
+    Kreg = K + (float(lam) * float(n)) * torch.eye(n, device=device, dtype=torch.float32)
+
+    try:
+        L = torch.linalg.cholesky(Kreg)
+        alpha = torch.cholesky_solve(y_train[:, None], L).squeeze(1)
+    except RuntimeError:
+        alpha = torch.linalg.solve(Kreg, y_train)
+
+    return {
+        'Phi_train': Phi_train.detach().cpu(),
+        'alpha': alpha.detach().cpu(),
+        'sigma': float(sigma_eff),
+        'sigma_base': float(sigma_base),
+        'lam': float(lam),
+        'n_train_krr': int(n),
+    }
+
+
+@torch.no_grad()
+def predict_rbf_krr(model, Phi_test, device=None):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    Phi_train = model['Phi_train'].to(device=device, dtype=torch.float32)
+    alpha = model['alpha'].to(device=device, dtype=torch.float32)
+    sigma = float(model['sigma'])
+
+    Phi_test = Phi_test.to(device=device, dtype=torch.float32)
+    K_test = rbf_kernel(Phi_test, Phi_train, sigma)
+    yhat = K_test @ alpha
+    return yhat.detach().cpu()
+
 ### New Bhat for the 3 layers model ###
 
 # @torch.no_grad()

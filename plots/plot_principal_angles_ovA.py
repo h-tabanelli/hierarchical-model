@@ -6,6 +6,7 @@ import sys
 import numpy as np
 import pandas as pd
 import torch
+import re
 
 import matplotlib
 matplotlib.use("Agg")
@@ -25,6 +26,9 @@ import teacher  # noqa: E402
 MODEL = "true"
 P_MAX = 20                 # number of curves you want
 A_MODE_TEACHER = "sym_orth_frob"
+PLOT_TOPK_SUMMARY = True
+TOPK_MEAN = 15
+plot_th_tr = False
 
 RESULTS_ROOT = Path("results")
 OUTDIR = Path("figures/principal_angles")
@@ -34,6 +38,7 @@ OUTNAME = "ovA_principal_angles_cos2_vs_alpha"
 EXPS = [
     {"label": r"$\gamma=0.4$", "exp_id": "D400_eps05_g04_v2"},
     {"label": r"$\gamma=1.0$", "exp_id": "D400_eps05_g10_v2"},
+    {"label": r"$\gamma=0.0$", "exp_id": "D400_eps05_g00_v2"},
 ]
 
 # plotting style
@@ -45,6 +50,48 @@ GRID_ALPHA = 0.
 # =========================
 # helpers
 # =========================
+
+def parse_exp_params(exp_id: str) -> dict[str, float]:
+    """
+    Example: D400_eps05_g04_v2
+    -> {"D": 400, "eps": 0.5, "gamma": 0.4}
+    """
+    mD = re.search(r"D(\d+)", exp_id)
+    meps = re.search(r"eps(\d+)", exp_id)
+    mg = re.search(r"g(\d+)", exp_id)
+
+    if not (mD and meps and mg):
+        raise ValueError(f"Could not parse parameters from exp_id={exp_id}")
+
+    D = int(mD.group(1))
+
+    eps_raw = meps.group(1)
+    gamma_raw = mg.group(1)
+
+    # "05" -> 0.5, "10" -> 1.0, "00" -> 0.0
+    eps = int(eps_raw) / 10
+    gamma = int(gamma_raw) / 10
+
+    return {"D": D, "eps": eps, "gamma": gamma}
+
+def topk_mean_by_alpha(g: pd.DataFrame, k: int = 4) -> pd.DataFrame:
+    """
+    Input: grouped dataframe with columns alpha, i, cos2_mean
+    Output: alpha -> mean over i=1..k of cos2_mean
+    """
+    rows = []
+    for alpha, ga in g.groupby("alpha"):
+        ga = ga.sort_values("i")
+        vals = ga.loc[ga["i"] <= k, "cos2_mean"].to_numpy(float)
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            continue
+        rows.append({
+            "alpha": float(alpha),
+            "topk_mean": float(np.mean(vals)),
+            "k_eff": int(vals.size),
+        })
+    return pd.DataFrame(rows).sort_values("alpha")
 
 def _round_alpha(a: float) -> float:
     return float(np.round(a, 10))
@@ -163,21 +210,50 @@ def plot_one_exp(exp_id: str, label: str):
     df = collect_cos2_table(exp_id)
     g = mean_sem_by_alpha(df)
 
-    OUTDIR.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(1, 1, figsize=(7.6, 4.2), constrained_layout=True)
-    ax.set_title(f"{label}  (exp_id={exp_id})", fontsize=13)
+    params = parse_exp_params(exp_id)
+    d = params["D"]
+    eps = params["eps"]
+    gamma = params["gamma"]
 
-    # One curve per i
+    OUTDIR.mkdir(parents=True, exist_ok=True)
+
+    if PLOT_TOPK_SUMMARY:
+        fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.2), constrained_layout=True)
+        ax = axes[0]
+        ax2 = axes[1]
+    else:
+        fig, ax = plt.subplots(1, 1, figsize=(7.6, 4.2), constrained_layout=True)
+        ax2 = None
+
+    fig.suptitle(
+        rf"$d={d},\ \epsilon={eps},\ \gamma={gamma}$",
+        fontsize=13
+    )
+
+    # -------------------------
+    # Left panel: one curve per i
+    # -------------------------
     for i in sorted(g["i"].unique()):
         gi = g[g["i"] == i]
         x = gi["alpha"].to_numpy(float)
         y = gi["cos2_mean"].to_numpy(float)
         e = gi["cos2_sem"].to_numpy(float)
 
-        line, = ax.plot(x, y, linewidth=LINEWIDTH, label=f"i={int(i)}")
+        if gamma == 0.0:
+            alpha_th = 2 + eps
+        elif gamma < 0.5:
+            alpha_th = 2 + (1 - 2 * gamma) * eps + 2 * gamma * np.log(i) / np.log(d)
+        else:
+            alpha_th = 2 + 2 * gamma * np.log(i) / np.log(d)
+
+        line, = ax.plot(x, y, alpha=0.5, linewidth=LINEWIDTH, label=f"i={int(i)}")
         col = line.get_color()
+
         if np.all(np.isfinite(e)):
             ax.fill_between(x, y - e, y + e, alpha=BAND_ALPHA, color=col)
+
+        if plot_th_tr:
+            ax.axvline(alpha_th, color=col, linestyle="dashed", linewidth=0.8, alpha=0.7)
 
     ax.set_xlabel(r"$\alpha=\log(n)/\log(d)$")
     ax.set_ylabel(r"$\cos^2(\theta_i)$  (principal angles)")
@@ -185,13 +261,58 @@ def plot_one_exp(exp_id: str, label: str):
     ax.grid(True, alpha=GRID_ALPHA)
 
     # legend outside
-    ax.legend(ncol=2, fontsize=9, frameon=True, loc="center left", bbox_to_anchor=(1.02, 0.5))
+    ax.legend(
+        ncol=2,
+        fontsize=9,
+        frameon=True,
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5)
+    )
 
-    out_png = OUTDIR / f"{OUTNAME}_{exp_id}_P{P_MAX}.png"
-    out_pdf = OUTDIR / f"{OUTNAME}_{exp_id}_P{P_MAX}.pdf"
+    # -------------------------
+    # Right panel: top-k summary
+    # -------------------------
+    if PLOT_TOPK_SUMMARY and ax2 is not None:
+        g_topk = topk_mean_by_alpha(g, k=TOPK_MEAN)
+
+        x2 = g_topk["alpha"].to_numpy(float)
+        y2 = g_topk["topk_mean"].to_numpy(float)
+
+        ax2.plot(x2, y2, color="black", linewidth=2.2, label=fr"mean over top {TOPK_MEAN}")
+
+        if plot_th_tr:
+            for i in range(1, TOPK_MEAN + 1):
+                if gamma == 0.0:
+                    alpha_th = 2 + eps
+                elif gamma < 0.5:
+                    alpha_th = 2 + (1 - 2 * gamma) * eps + 2 * gamma * np.log(i) / np.log(d)
+                else:
+                    alpha_th = 2 + 2 * gamma * np.log(i) / np.log(d)
+
+                ax2.axvline(alpha_th, color="black", linestyle="dashed", linewidth=0.8, alpha=0.35)
+
+        ax2.set_xlabel(r"$\alpha=\log(n)/\log(d)$")
+        ax2.set_ylabel(fr"Mean of top {TOPK_MEAN} $\cos^2(\theta_i)$")
+        ax2.set_ylim(-0.02, 1.02)
+        ax2.grid(True, alpha=GRID_ALPHA)
+        ax2.legend(frameon=True)
+
+    # -------------------------
+    # Save with different names
+    # -------------------------
+    suffix = f"_P{P_MAX}"
+    if PLOT_TOPK_SUMMARY:
+        suffix += f"_topk{TOPK_MEAN}"
+    if plot_th_tr:
+        suffix += "_theory"
+
+    out_png = OUTDIR / f"{OUTNAME}_{exp_id}{suffix}.png"
+    out_pdf = OUTDIR / f"{OUTNAME}_{exp_id}{suffix}.pdf"
+
     fig.savefig(out_png, dpi=220, bbox_inches="tight")
     fig.savefig(out_pdf, bbox_inches="tight")
     plt.close(fig)
+
     print("Saved:", out_png)
     print("Saved:", out_pdf)
 

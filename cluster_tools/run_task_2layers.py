@@ -69,6 +69,40 @@ def _raw_pred_from_input(X_or_Z, Ahat, Bhat_cpu, model: str, device):
     s = torch.einsum("bp,pq,bq->b", Hhat, Bhat_t, Hhat) - trB
     return s
 
+def _maybe_load_saved_Ahat(
+    outdir_root: Path,
+    source_exp_id: str | None,
+    alpha: float,
+    seed: int,
+    model: str,
+    device,
+):
+    """
+    Search for a previously saved Ahat from a spectral_B run:
+      results/<source_exp_id>/chunk=*/seed=XXXX/artifacts/alpha=.../model=.../head=spectral_B/estimates.pt
+    """
+    if source_exp_id is None:
+        return None
+
+    root = Path(outdir_root) / str(source_exp_id)
+    if not root.exists():
+        return None
+
+    pattern = (
+        f"chunk=*/seed={seed:04d}/artifacts/"
+        f"alpha={alpha:.4f}/model={model}/head=spectral_B/estimates.pt"
+    )
+    hits = sorted(root.glob(pattern))
+    if not hits:
+        return None
+
+    payload = torch.load(hits[0], map_location=device)
+    Ahat = payload.get("Ahat", None)
+    if Ahat is None:
+        return None
+
+    return Ahat.to(device=device, dtype=torch.float32)
+
 
 @torch.no_grad()
 def _run_one_alpha_model(
@@ -87,6 +121,13 @@ def _run_one_alpha_model(
     g_name: str,
     fit_degree: int,
     fit_ridge: float,
+    head_mode: str,
+    n_krr_max: int,
+    rbf_lambda: float,
+    rbf_sigma_mult: float,
+    rbf_standardize: bool,
+    poly_lambda: float,
+    m_rf: int,
     n_iter_C_max: int,
     oversamp_C: int,
     T_min: int,
@@ -94,8 +135,10 @@ def _run_one_alpha_model(
     Q_init: torch.Tensor | None,
     device: torch.device,
     Xte: torch.Tensor,
-    jobdir: Path, 
+    jobdir: Path,
     save_estimates: bool = False,
+    outdir_root: Path,
+    load_ahat_exp_id: str | None,
 ) -> tuple[dict, torch.Tensor | None]:
     """Run a single (alpha, model) and return (metrics_dict, Q_full_for_warm_start)."""
     t0 = time.time()
@@ -105,6 +148,10 @@ def _run_one_alpha_model(
 
     act = teacher.get_activation_fn(g_name=g_name, g_callable=None)
     is_id = (g_name is None) or (g_name == "id")
+
+    head_mode = str(head_mode)
+    if head_mode not in {"spectral_B", "latent_rbf", "input_rbf"}:
+        raise ValueError(f"Unknown head_mode: {head_mode}")
 
     # ---- pass 1: mean/std ----
     mean_y, std_y = teacher.compute_mean_std_y_stream(
@@ -128,94 +175,143 @@ def _run_one_alpha_model(
                 yield X_or_Z, y_norm
         return stream_fn
 
-    # ---- Step 1: Ahat (warm start + early stop on iterations) ----
-    if stop_tol is None:
-        Ahat = estimators.top_p_eigmats_of_C(
-            stream_fn_factory=stream_fn_factory,
-            d=d, n_total=n, p=p,
-            n_iter=n_iter_C_max,
-            oversamp=oversamp_C,
+    # ---- Step 1: Ahat (warm start + early stop on iterations), or load from saved artifacts ----
+    loaded_Ahat = False
+
+    if head_mode == "latent_rbf" and load_ahat_exp_id is not None:
+        Ahat_loaded = _maybe_load_saved_Ahat(
+            outdir_root=outdir_root,
+            source_exp_id=load_ahat_exp_id,
+            alpha=float(alpha),
+            seed=int(seed),
+            model=str(model),
             device=device,
-            input_mode=model,
-            Q_init=Q_init
         )
-        Q_full = None
-        info = {"n_iter_effective": n_iter_C_max, "stop_delta": None}
-    else:
-        Ahat, Q_full, info = estimators.top_p_eigmats_of_C(
+        if Ahat_loaded is not None:
+            Ahat = Ahat_loaded
+            Q_full = None
+            info = {"n_iter_effective": 0, "stop_delta": None, "loaded_Ahat": True}
+            loaded_Ahat = True
+
+    if not loaded_Ahat:
+        if stop_tol is None:
+            Ahat = estimators.top_p_eigmats_of_C(
+                stream_fn_factory=stream_fn_factory,
+                d=d, n_total=n, p=p,
+                n_iter=n_iter_C_max,
+                oversamp=oversamp_C,
+                device=device,
+                input_mode=model,
+                Q_init=Q_init
+            )
+            Q_full = None
+            info = {"n_iter_effective": n_iter_C_max, "stop_delta": None, "loaded_Ahat": False}
+        else:
+            Ahat, Q_full, info = estimators.top_p_eigmats_of_C(
+                stream_fn_factory=stream_fn_factory,
+                d=d, n_total=n, p=p,
+                n_iter=n_iter_C_max,
+                oversamp=oversamp_C,
+                device=device,
+                input_mode=model,
+                Q_init=Q_init,
+                T_min=T_min,
+                stop_tol=stop_tol,
+                return_Q_full=True,
+                return_info=True
+            )
+            info["loaded_Ahat"] = False
+
+    # ---- Step 2: fit the head ----
+    Bhat_cpu = None
+    coeffs = None
+    mu_sig = None
+    rbf_model = None
+    primal_model = None
+    rf_map = None
+
+    if head_mode == "spectral_B":
+        if model == "true":
+            Bhat_cpu = estimators.estimate_Bhat_from_stream(
+                stream_fn=stream_fn_factory(),
+                Ahat=Ahat, p=p, n_total=n,
+                device=device
+            )
+        else:
+            Ahat_flat = teacher.flatten_A_sym_for_H2_feature(Ahat).to(device=device, dtype=torch.float32)
+
+            def Hhat_stream():
+                for Z, y_norm in stream_fn_factory()():
+                    Z = Z.to(device=device, dtype=torch.float32)
+                    Hhat = Z @ Ahat_flat.T
+                    yield Hhat, y_norm
+
+            Bhat_cpu = estimators.estimate_Bhat_from_H_stream(
+                stream_fn=Hhat_stream, p=p, n_total=n, device=device
+            )
+
+        # ---- calibration / link ----
+        if is_id:
+            s_list = []
+            for j, (X_or_Z, _) in enumerate(stream_fn_factory()()):
+                s = _raw_pred_from_input(X_or_Z, Ahat, Bhat_cpu, model, device)
+                s_list.append(s.detach().cpu().numpy())
+                if j + 1 >= 2:
+                    break
+            s_cal = np.concatenate(s_list, axis=0)
+            scale = 1.0 / (np.std(s_cal) + 1e-12)
+            Bhat_cpu = Bhat_cpu * float(scale)
+        else:
+            s_list, y_list = [], []
+            for j, (X_or_Z, y_norm) in enumerate(stream_fn_factory()()):
+                s = _raw_pred_from_input(X_or_Z, Ahat, Bhat_cpu, model, device)
+                s_list.append(s.detach().cpu().numpy())
+                y_list.append(y_norm.detach().cpu().numpy())
+                if j + 1 >= 10:
+                    break
+            s_fit = np.concatenate(s_list, axis=0)
+            y_fit = np.concatenate(y_list, axis=0)
+            coeffs, mu_sig = estimators.fit_polynomial_link(
+                s_fit, y_fit, degree=fit_degree, ridge=fit_ridge
+            )
+
+        elif head_mode == "latent_poly2":
+        if model == "true":
+            def feature_batch_fn(X_batch):
+                Hhat = estimators.compute_hhat_from_X_and_Ahat(
+                    X_batch.to(device=device, dtype=torch.float32), Ahat
+                ).to(device=device, dtype=torch.float32)
+                return estimators.build_latent_poly2_features(Hhat)
+        else:
+            Ahat_flat = teacher.flatten_A_sym_for_H2_feature(Ahat).to(device=device, dtype=torch.float32)
+
+            def feature_batch_fn(Z_batch):
+                Hhat = Z_batch.to(device=device, dtype=torch.float32) @ Ahat_flat.T
+                return estimators.build_latent_poly2_features(Hhat)
+
+        primal_model = estimators.fit_primal_ridge_from_stream(
             stream_fn_factory=stream_fn_factory,
-            d=d, n_total=n, p=p,
-            n_iter=n_iter_C_max,
-            oversamp=oversamp_C,
+            feature_batch_fn=feature_batch_fn,
+            lam=poly_lambda,
             device=device,
-            input_mode=model,
-            Q_init=Q_init,
-            T_min=T_min,
-            stop_tol=stop_tol,
-            return_Q_full=True,
-            return_info=True
         )
 
-    # ---- Step 2: Bhat ----
-    if model == "true":
-        Bhat_cpu = estimators.estimate_Bhat_from_stream(
-            stream_fn=stream_fn_factory(),   # IMPORTANT: pass callable, not generator
-            Ahat=Ahat, p=p, n_total=n,
-            device=device
+    elif head_mode == "input_poly4_rf":
+        rf_map = estimators.init_input_poly4_rf_map(d=d, m_rf=m_rf, device=device, seed=seed + 123456)
+
+        def feature_batch_fn(X_or_Z_batch):
+            return estimators.apply_input_poly4_rf_map(
+                X_or_Z_batch.to(device=device, dtype=torch.float32),
+                rf_map,
+                device=device,
+            )
+
+        primal_model = estimators.fit_primal_ridge_from_stream(
+            stream_fn_factory=stream_fn_factory,
+            feature_batch_fn=feature_batch_fn,
+            lam=poly_lambda,
+            device=device,
         )
-    else:
-        Ahat_flat = teacher.flatten_A_sym_for_H2_feature(Ahat).to(device=device, dtype=torch.float32)
-
-        def Hhat_stream():
-            for Z, y_norm in stream_fn_factory()():
-                Z = Z.to(device=device, dtype=torch.float32)
-                Hhat = Z @ Ahat_flat.T
-                yield Hhat, y_norm
-
-        Bhat_cpu = estimators.estimate_Bhat_from_H_stream(
-            stream_fn=Hhat_stream, p=p, n_total=n, device=device
-        )
-
-    # ---- Optional: save estimates for posthoc analysis ----
-    if save_estimates:
-        artdir = jobdir / "artifacts" / f"alpha={alpha:.4f}" / f"model={model}"
-        artdir.mkdir(parents=True, exist_ok=True)
-
-        payload = {
-            "alpha": float(alpha),
-            "d": int(d),
-            "p": int(p),
-            "seed": int(seed),
-            "model": str(model),
-            "Ahat": Ahat.detach().to(device="cpu", dtype=torch.float16),
-            "Bhat": Bhat_cpu.detach().to(device="cpu", dtype=torch.float16),
-        }
-        torch.save(payload, artdir / "estimates.pt")
-
-    # ---- calibration / link ----
-    if is_id:
-        s_list = []
-        for j, (X_or_Z, _) in enumerate(stream_fn_factory()()):
-            s = _raw_pred_from_input(X_or_Z, Ahat, Bhat_cpu, model, device)
-            s_list.append(s.detach().cpu().numpy())
-            if j + 1 >= 2:
-                break
-        s_cal = np.concatenate(s_list, axis=0)
-        scale = 1.0 / (np.std(s_cal) + 1e-12)
-        Bhat_cpu = Bhat_cpu * float(scale)
-        coeffs = None
-        mu_sig = None
-    else:
-        s_list, y_list = [], []
-        for j, (X_or_Z, y_norm) in enumerate(stream_fn_factory()()):
-            s = _raw_pred_from_input(X_or_Z, Ahat, Bhat_cpu, model, device)
-            s_list.append(s.detach().cpu().numpy())
-            y_list.append(y_norm.detach().cpu().numpy())
-            if j + 1 >= 10:
-                break
-        s_fit = np.concatenate(s_list, axis=0)
-        y_fit = np.concatenate(y_list, axis=0)
-        coeffs, mu_sig = estimators.fit_polynomial_link(s_fit, y_fit, degree=fit_degree, ridge=fit_ridge)
 
     # ---- rebuild teacher (for overlaps + test y) ----
     gen = torch.Generator(device=device)
@@ -228,48 +324,142 @@ def _run_one_alpha_model(
     if B_mode == "dense":
         B_teacher = teacher.gen_B_symmetric_dense_torch(p, gen, device, beta=beta)
     elif B_mode == "powerlaw_diag":
-        B_teacher = teacher.gen_B_powerlaw_diag_torch(p, gen, device, beta=beta, gamma=gamma, rademacher=True)
+        B_teacher = teacher.gen_B_powerlaw_diag_torch(
+            p, gen, device, beta=beta, gamma=gamma, rademacher=True
+        )
     else:
         raise ValueError(f"Unknown B_mode: {B_mode}")
 
     ovA = None
-    if A_mode_teacher == "sym_orth_frob":
+    if needs_Ahat and A_mode_teacher == "sym_orth_frob":
         Atrue = A_teacher["A"].detach()
         ovA = float(mps.subspace_overlap_frob(Ahat.detach(), Atrue))
 
     if model == "true":
         Hte_true = teacher.compute_h_from_X_torch(Xte, A_teacher).to(device=device, dtype=torch.float32)
-        Hte_hat = estimators.compute_hhat_from_X_and_Ahat(Xte, Ahat).to(device=device, dtype=torch.float32)
-        Hte_true_for_overlap = Hte_true
+        # Hte_hat = estimators.compute_hhat_from_X_and_Ahat(Xte, Ahat).to(device=device, dtype=torch.float32)
+        # Hte_true_for_overlap = Hte_true
         ste_true = teacher.compute_y_from_H_torch(Hte_true, B_teacher).to(device=device, dtype=torch.float32)
-        ste_hat = teacher.compute_y_from_H_torch(Hte_hat, B_teacher).to(device=device, dtype=torch.float32)
+        # ste_hat = teacher.compute_y_from_H_torch(Hte_hat, B_teacher).to(device=device, dtype=torch.float32)
         X_or_Z_test = Xte
+        if needs_Ahat:
+            Hte_hat = estimators.compute_hhat_from_X_and_Ahat(Xte, Ahat).to(device=device, dtype=torch.float32)
+            Hte_true_for_overlap = Hte_true
+            ste_hat = teacher.compute_y_from_H_torch(Hte_hat, B_teacher).to(device=device, dtype=torch.float32)
+        else:
+            Hte_hat = None
+            Hte_true_for_overlap = None
+            ste_hat = None
     else:
-        Ahat_flat  = teacher.flatten_A_sym_for_H2_feature(Ahat).to(device=device, dtype=torch.float32)
+        # Ahat_flat = teacher.flatten_A_sym_for_H2_feature(Ahat).to(device=device, dtype=torch.float32)
         Atrue_flat = teacher.flatten_A_sym_for_H2_feature(A_teacher["A"]).to(device=device, dtype=torch.float32)
-        gen_te = torch.Generator(device=device); gen_te.manual_seed(seed + 9999)
+        gen_te = torch.Generator(device=device)
+        gen_te.manual_seed(seed + 9999)
         Zte = torch.randn(n_test, Ahat_flat.shape[1], generator=gen_te, device=device, dtype=torch.float32)
-        Hte_hat = Zte @ Ahat_flat.T
-        Hte_true_for_overlap = Zte @ Atrue_flat.T
-        Hte_true = Hte_true_for_overlap
+        # Hte_hat = Zte @ Ahat_flat.T
+        # Hte_true_for_overlap = Zte @ Atrue_flat.T
+        Hte_true = Zte @ Atrue_flat.T
         ste_true = teacher.compute_y_from_H_torch(Hte_true, B_teacher).to(device=device, dtype=torch.float32)
-        ste_hat = teacher.compute_y_from_H_torch(Hte_hat, B_teacher).to(device=device, dtype=torch.float32)
+        # ste_hat = teacher.compute_y_from_H_torch(Hte_hat, B_teacher).to(device=device, dtype=torch.float32)
         X_or_Z_test = Zte
+    if needs_Ahat:
+            Ahat_flat = teacher.flatten_A_sym_for_H2_feature(Ahat).to(device=device, dtype=torch.float32)
+            Hte_hat = Zte @ Ahat_flat.T
+            Hte_true_for_overlap = Hte_true
+            ste_hat = teacher.compute_y_from_H_torch(Hte_hat, B_teacher).to(device=device, dtype=torch.float32)
+        else:
+            Hte_hat = None
+            Hte_true_for_overlap = None
+            ste_hat = None
+
+    # ---- Optional: save estimates for posthoc analysis ----
+    if save_estimates:
+        artdir = jobdir / "artifacts" / f"alpha={alpha:.4f}" / f"model={model}" / f"head={head_mode}"
+        artdir.mkdir(parents=True, exist_ok=True)
+
+        payload = {
+            "alpha": float(alpha),
+            "d": int(d),
+            "p": int(p),
+            "seed": int(seed),
+            "model": str(model),
+            "head_mode": str(head_mode),
+            "Ahat": Ahat.detach().to(device="cpu", dtype=torch.float16),
+            "Bhat": None if Bhat_cpu is None else Bhat_cpu.detach().to(device="cpu", dtype=torch.float16),
+        }
+        torch.save(payload, artdir / "estimates.pt")
 
     s_te = teacher.compute_y_from_H_torch(Hte_true, B_teacher)
     yte_raw = act(s_te).detach().cpu().numpy()
     yte = (yte_raw - float(mean_y)) / float(std_y)
 
-    ovH = float(mps.feature_overlap_corr_invariant(Hte_hat, Hte_true_for_overlap))
-    corr_s = float(mps.corr_second_layer_scalar(ste_hat, ste_true))
+    if needs_Ahat:
+        ovH = float(mps.feature_overlap_corr_invariant(Hte_hat, Hte_true_for_overlap))
+        corr_s = float(mps.corr_second_layer_scalar(ste_hat, ste_true))
+    else:
+        ovH = None
+        corr_s = None
 
-    Bspec = mps.spectrum_metrics_B(Bhat_cpu, B_teacher)
-    eig_err_B = float(Bspec["eig_err_B"])
-    eig_corr_B = float(Bspec["eig_corr_B"])
-    c_opt_B = float(Bspec["c_opt_B"])
+    if head_mode == "spectral_B":
+        Bspec = mps.spectrum_metrics_B(Bhat_cpu, B_teacher)
+        eig_err_B = float(Bspec["eig_err_B"])
+        eig_corr_B = float(Bspec["eig_corr_B"])
+        c_opt_B = float(Bspec["c_opt_B"])
 
-    s_test = _raw_pred_from_input(X_or_Z_test, Ahat, Bhat_cpu, model, device).detach().cpu().numpy()
-    yhat = s_test if is_id else estimators.predict_polynomial_link(s_test, coeffs, mu_sig=mu_sig)
+        s_test = _raw_pred_from_input(X_or_Z_test, Ahat, Bhat_cpu, model, device).detach().cpu().numpy()
+        yhat = s_test if is_id else estimators.predict_polynomial_link(s_test, coeffs, mu_sig=mu_sig)
+
+    elif head_mode in {"latent_rbf", "input_rbf"}:
+        representation = "h1" if head_mode == "latent_rbf" else "x"
+
+        Phi_train, y_train = estimators.collect_representation_train_from_stream(
+            stream_fn_factory=stream_fn_factory,
+            representation=representation,
+            n_keep=(None if int(n_krr_max) <= 0 else min(int(n), int(n_krr_max))),
+            model=model,
+            Ahat=Ahat,
+            device=device,
+        )
+
+        Phi_test = estimators.build_test_representation(
+            X_or_Z_test,
+            representation=representation,
+            model=model,
+            Ahat=Ahat,
+            device=device,
+        )
+
+        if rbf_standardize:
+            Phi_train, Phi_test, _, _ = estimators.standardize_features_train_test(Phi_train, Phi_test)
+
+        rbf_model = estimators.fit_rbf_krr(
+            Phi_train,
+            y_train,
+            sigma=None,
+            lam=rbf_lambda,
+            sigma_mult=rbf_sigma_mult,
+            device=device,
+        )
+
+        yhat = estimators.predict_rbf_krr(rbf_model, Phi_test, device=device).numpy()
+
+        eig_err_B = None
+        eig_corr_B = None
+        c_opt_B = None
+
+    elif head_mode == "latent_poly2":
+        Phi_test = estimators.build_latent_poly2_features(Hte_hat)
+        yhat = estimators.predict_primal_ridge(primal_model, Phi_test, device=device).numpy()
+        eig_err_B = None
+        eig_corr_B = None
+        c_opt_B = None
+
+    elif head_mode == "input_poly4_rf":
+        Phi_test = estimators.apply_input_poly4_rf_map(X_or_Z_test, rf_map, device=device)
+        yhat = estimators.predict_primal_ridge(primal_model, Phi_test, device=device).numpy()
+        eig_err_B = None
+        eig_corr_B = None
+        c_opt_B = None
 
     mse = float(np.mean((yhat - yte) ** 2))
     baseline = float(np.mean(yte ** 2))
@@ -287,6 +477,20 @@ def _run_one_alpha_model(
         "B_mode": str(B_mode),
         "gamma": float(gamma),
         "g_name": str(g_name),
+        "head_mode": str(head_mode),
+        "n_krr_max": int(n_krr_max),
+        "rbf_lambda": float(rbf_lambda),
+        "rbf_sigma_mult": float(rbf_sigma_mult),
+        "rbf_standardize": bool(rbf_standardize),
+        "rbf_sigma": None if rbf_model is None else float(rbf_model["sigma"]),
+        "rbf_sigma_base": None if rbf_model is None else float(rbf_model["sigma_base"]),
+        "n_train_krr": None if rbf_model is None else int(rbf_model["n_train_krr"]),
+        "loaded_Ahat": bool(info.get("loaded_Ahat", False)),
+        "load_ahat_exp_id": None if load_ahat_exp_id is None else str(load_ahat_exp_id),
+        "poly_lambda": float(poly_lambda),
+        "m_rf": int(m_rf),
+        "n_train_primal": None if primal_model is None else int(primal_model["n_train"]),
+        "feature_dim": None if primal_model is None else int(primal_model["feature_dim"]),
         "batch_size": int(batch_size),
         "n_iter_C_max": int(n_iter_C_max),
         "n_iter_C_effective": int(info.get("n_iter_effective", n_iter_C_max)),
@@ -300,14 +504,13 @@ def _run_one_alpha_model(
         "ovA": None if ovA is None else float(ovA),
         "ovH": float(ovH),
         "corr_s": float(corr_s),
-        "eig_err_B": float(eig_err_B),
-        "eig_corr_B": float(eig_corr_B),
-        "c_opt_B": float(c_opt_B),
+        "eig_err_B": None if eig_err_B is None else float(eig_err_B),
+        "eig_corr_B": None if eig_corr_B is None else float(eig_corr_B),
+        "c_opt_B": None if c_opt_B is None else float(c_opt_B),
         "wall_seconds": float(time.time() - t0),
         "device": str(device),
     }
     return metrics, Q_full
-
 
 def _read_task_from_jsonl(taskfile: Path, task_id: int) -> dict:
     with taskfile.open("r", encoding="utf-8") as f:
@@ -361,6 +564,17 @@ def main() -> None:
 
     fit_degree = int(task.get("fit_degree", 5))
     fit_ridge = float(task.get("fit_ridge", 1e-6))
+    head_mode = str(task.get("head_mode", "spectral_B"))
+    n_krr_max = int(task.get("n_krr_max", 4000))
+    rbf_lambda = float(task.get("rbf_lambda", 1e-4))
+    rbf_sigma_mult = float(task.get("rbf_sigma_mult", 1.0))
+    rbf_standardize = bool(task.get("rbf_standardize", True))
+    poly_lambda = float(task.get("poly_lambda", 1e-4))
+    m_rf = int(task.get("m_rf", 1024))
+
+    load_ahat_exp_id = task.get("load_ahat_exp_id", None)
+    if load_ahat_exp_id in {"", "none", "null"}:
+        load_ahat_exp_id = None
 
     device = _default_device(task.get("device", None))
 
@@ -409,6 +623,15 @@ def main() -> None:
                     Q_init=Q_state[model],
                     device=device, Xte=Xte,
                     jobdir=jobdir, save_estimates=task.get("save_estimates", False),
+                    head_mode=head_mode,
+                    n_krr_max=n_krr_max,
+                    rbf_lambda=rbf_lambda,
+                    rbf_sigma_mult=rbf_sigma_mult,
+                    rbf_standardize=rbf_standardize,
+                    outdir_root=outdir,
+                    load_ahat_exp_id=load_ahat_exp_id,
+                    poly_lambda=poly_lambda,
+                    m_rf=m_rf,
                 )
 
                 if Q_full is not None:
@@ -418,10 +641,11 @@ def main() -> None:
                 f.write(json.dumps(metrics) + "\n")
                 f.flush()
 
+                eig_err_B_str = "None" if metrics["eig_err_B"] is None else f"{metrics['eig_err_B']:.4g}"
                 print(
-                    f"chunk={chunk_id:04d} seed={seed:04d} model={model} "
+                    f"chunk={chunk_id:04d} seed={seed:04d} model={model} head={metrics['head_mode']} "
                     f"alpha={alpha:.4g} n={metrics['n']} nmse={metrics['nmse']:.4g} "
-                    f"ovA={metrics['ovA']} corr_s={metrics['corr_s']:.4g} eigErrB={metrics['eig_err_B']:.4g} "
+                    f"ovA={metrics['ovA']} corr_s={metrics['corr_s']:.4g} eigErrB={eig_err_B_str} "
                     f"iters={metrics['n_iter_C_effective']} delta={metrics.get('stop_delta', None)}"
                 )
 

@@ -836,5 +836,402 @@ def compute_mean_std_y_stream_hier2_skip(
     std = torch.sqrt(var)
     return mean, std
 
+#######################################################
+# New unified 3-layer teacher (extensible API) NEW WAVE
+#######################################################
+
+def gen_A3_torch(
+    p2,
+    gen,
+    device,
+    A3_mode="dense",
+    beta=1.0,
+    gamma=0.0,
+    rademacher=True,
+):
+    """
+    Third-layer quadratic readout on h2.
+    Returns a matrix A3 of shape (p2, p2).
+
+    Modes
+    -----
+    - "dense"         : symmetric dense GOE-like, normalized like current B
+    - "powerlaw_diag" : diagonal power-law prior
+    """
+    if A3_mode == "dense":
+        return gen_B_symmetric_dense_torch(p2, gen, device, beta=beta)
+
+    if A3_mode == "powerlaw_diag":
+        return gen_B_powerlaw_diag_torch(
+            p=p2,
+            gen=gen,
+            device=device,
+            beta=beta,
+            gamma=gamma,
+            rademacher=rademacher,
+        )
+
+    raise ValueError(f"Unknown A3_mode: {A3_mode}")
+
+
+def build_teacher_3layers(
+    d,
+    p1,
+    p2,
+    *,
+    A1_mode="sym_orth_frob",
+    A2_mode="sym_orth_frob",
+    A3_mode="dense",
+    beta3=1.0,
+    gamma3=0.0,
+    skip_mode="none",
+    skip_scale1=0.0,
+    skip_scale2=0.0,
+    seed=0,
+    device=None,
+):
+    """
+    Build one fixed 3-layer teacher:
+      x -> h1 -> h2 -> s3 -> y
+    where
+      h1 = <A1, H2(x)> or rank1 version
+      h2 = quadratic features of h1 via A2
+      s3 = h2^T A3 h2 - Tr(A3) [+ optional skips]
+      y  = g(s3)
+
+    For now, the recommended default is:
+      skip_mode="none", A3_mode="dense".
+    """
+    if device is None:
+        device = get_device()
+
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(seed))
+
+    # ---- A1 ----
+    if A1_mode == "rank1_orth":
+        A1_teacher = gen_A_rank1_orth_torch(d, p1, gen, device)
+    elif A1_mode == "sym_orth_frob":
+        A1_teacher = gen_A_sym_orth_frob_torch(d, p1, gen, device)
+    else:
+        raise ValueError("A1_mode must be 'rank1_orth' or 'sym_orth_frob'")
+
+    # ---- A2 ----
+    if A2_mode == "rank1_orth":
+        A2_teacher = gen_A_rank1_orth_torch(p1, p2, gen, device)
+    elif A2_mode == "sym_orth_frob":
+        A2_teacher = gen_A_sym_orth_frob_torch(p1, p2, gen, device)
+    else:
+        raise ValueError("A2_mode must be 'rank1_orth' or 'sym_orth_frob'")
+
+    # ---- A3 ----
+    A3_teacher = gen_A3_torch(
+        p2=p2,
+        gen=gen,
+        device=device,
+        A3_mode=A3_mode,
+        beta=beta3,
+        gamma=gamma3,
+        rademacher=True,
+    )
+
+    # ---- optional skip vectors ----
+    if skip_mode not in {"none", "pre"}:
+        raise ValueError("skip_mode must be one of {'none', 'pre'}")
+
+    b1 = None
+    b2 = None
+    if skip_mode == "pre":
+        b1 = gen_b_gaussian_torch(p1, gen, device, scale=skip_scale1)
+        b2 = gen_b_gaussian_torch(p2, gen, device, scale=skip_scale2)
+
+    return {
+        "A1": A1_teacher,
+        "A2": A2_teacher,
+        "A3": A3_teacher,
+        "skip_mode": skip_mode,
+        "b1": b1,
+        "b2": b2,
+        "p1": int(p1),
+        "p2": int(p2),
+        "d": int(d),
+        "A1_mode": A1_mode,
+        "A2_mode": A2_mode,
+        "A3_mode": A3_mode,
+        "beta3": float(beta3),
+        "gamma3": float(gamma3),
+    }
+
+
+def forward_teacher_3layers_from_X(
+    X,
+    teacher_3L,
+    *,
+    g_name="id",
+    g_callable=None,
+    return_intermediates=False,
+):
+    """
+    Forward pass for the unified 3-layer teacher.
+
+    Returns
+    -------
+    if return_intermediates=False:
+        y
+    else:
+        dict with keys {"h1", "h2", "s3", "y"}
+    """
+    act = get_activation_fn(g_name=g_name, g_callable=g_callable)
+
+    A1 = teacher_3L["A1"]
+    A2 = teacher_3L["A2"]
+    A3 = teacher_3L["A3"]
+    skip_mode = teacher_3L["skip_mode"]
+    b1 = teacher_3L["b1"]
+    b2 = teacher_3L["b2"]
+
+    # layer 1
+    h1 = compute_h_from_X_torch(X, A1)
+
+    # layer 2
+    h2 = compute_h2_from_H1_torch(h1, A2)
+
+    # layer 3 quadratic scalar pre-activation
+    s3 = compute_y_from_H_torch(h2, A3)
+
+    # optional skip connections in the PRE-ACTIVATION only
+    if skip_mode == "pre":
+        if b1 is not None:
+            s3 = s3 + torch.einsum("bp,p->b", h1, b1)
+        if b2 is not None:
+            s3 = s3 + torch.einsum("bp,p->b", h2, b2)
+
+    y = act(s3)
+
+    if return_intermediates:
+        return {
+            "h1": h1,
+            "h2": h2,
+            "s3": s3,
+            "y": y,
+        }
+    return y
+
+
+@torch.no_grad()
+def stream_batches_teacher_3layers_v2(
+    d,
+    p1,
+    p2,
+    n,
+    batch_size,
+    *,
+    A1_mode="sym_orth_frob",
+    A2_mode="sym_orth_frob",
+    A3_mode="dense",
+    beta3=1.0,
+    gamma3=0.0,
+    skip_mode="none",
+    skip_scale1=0.0,
+    skip_scale2=0.0,
+    seed=0,
+    device=None,
+    g_name="id",
+    g_callable=None,
+):
+    """
+    Streaming 3-layer teacher with a fixed teacher rebuilt from a seed.
+
+    Yields:
+      X, H1, H2, S3, Y, teacher_3L
+    """
+    if device is None:
+        device = get_device()
+
+    teacher_3L = build_teacher_3layers(
+        d=d,
+        p1=p1,
+        p2=p2,
+        A1_mode=A1_mode,
+        A2_mode=A2_mode,
+        A3_mode=A3_mode,
+        beta3=beta3,
+        gamma3=gamma3,
+        skip_mode=skip_mode,
+        skip_scale1=skip_scale1,
+        skip_scale2=skip_scale2,
+        seed=seed,
+        device=device,
+    )
+
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(seed) + 777_777)
+
+    seen = 0
+    while seen < n:
+        bs = min(batch_size, n - seen)
+        X = torch.randn(bs, d, generator=gen, device=device)
+
+        out = forward_teacher_3layers_from_X(
+            X,
+            teacher_3L,
+            g_name=g_name,
+            g_callable=g_callable,
+            return_intermediates=True,
+        )
+        yield X, out["h1"], out["h2"], out["s3"], out["y"], teacher_3L
+        seen += bs
+
+
+@torch.no_grad()
+def compute_mean_std_y_stream_3layers_v2(
+    d,
+    p1,
+    p2,
+    n,
+    batch_size,
+    *,
+    A1_mode="sym_orth_frob",
+    A2_mode="sym_orth_frob",
+    A3_mode="dense",
+    beta3=1.0,
+    gamma3=0.0,
+    skip_mode="none",
+    skip_scale1=0.0,
+    skip_scale2=0.0,
+    seed=0,
+    device=None,
+    g_name="id",
+    g_callable=None,
+):
+    """
+    One streaming pass to estimate mean/std of y for normalization.
+    Returns CPU float64 tensors (mean_y, std_y).
+    """
+    if device is None:
+        device = get_device()
+
+    count = 0
+    mean = torch.tensor(0.0, device=device, dtype=torch.float64)
+    M2 = torch.tensor(0.0, device=device, dtype=torch.float64)
+
+    for _, _, _, _, y, _ in stream_batches_teacher_3layers_v2(
+        d=d,
+        p1=p1,
+        p2=p2,
+        n=n,
+        batch_size=batch_size,
+        A1_mode=A1_mode,
+        A2_mode=A2_mode,
+        A3_mode=A3_mode,
+        beta3=beta3,
+        gamma3=gamma3,
+        skip_mode=skip_mode,
+        skip_scale1=skip_scale1,
+        skip_scale2=skip_scale2,
+        seed=seed,
+        device=device,
+        g_name=g_name,
+        g_callable=g_callable,
+    ):
+        y64 = y.to(torch.float64)
+        bs = y64.numel()
+        count_new = count + bs
+
+        batch_mean = y64.mean()
+        batch_M2 = ((y64 - batch_mean) ** 2).sum()
+
+        if count == 0:
+            mean = batch_mean
+            M2 = batch_M2
+        else:
+            delta = batch_mean - mean
+            mean = mean + delta * (bs / count_new)
+            M2 = M2 + batch_M2 + delta**2 * (count * bs / count_new)
+
+        count = count_new
+
+    var = M2 / max(count, 1)
+    std = torch.sqrt(var + 1e-12)
+
+    return mean.detach().cpu(), std.detach().cpu()
+
+
+@torch.no_grad()
+def stream_batches_teacher_3layers_y_normalized_v2(
+    d,
+    p1,
+    p2,
+    n,
+    batch_size,
+    *,
+    A1_mode="sym_orth_frob",
+    A2_mode="sym_orth_frob",
+    A3_mode="dense",
+    beta3=1.0,
+    gamma3=0.0,
+    skip_mode="none",
+    skip_scale1=0.0,
+    skip_scale2=0.0,
+    seed=0,
+    device=None,
+    mean_y=None,
+    std_y=None,
+    g_name="id",
+    g_callable=None,
+):
+    """
+    Replay the same teacher and stream normalized labels:
+      y_norm = (y - mean_y) / std_y
+    """
+    if device is None:
+        device = get_device()
+
+    if mean_y is None or std_y is None:
+        mean_y, std_y = compute_mean_std_y_stream_3layers_v2(
+            d=d,
+            p1=p1,
+            p2=p2,
+            n=n,
+            batch_size=batch_size,
+            A1_mode=A1_mode,
+            A2_mode=A2_mode,
+            A3_mode=A3_mode,
+            beta3=beta3,
+            gamma3=gamma3,
+            skip_mode=skip_mode,
+            skip_scale1=skip_scale1,
+            skip_scale2=skip_scale2,
+            seed=seed,
+            device=device,
+            g_name=g_name,
+            g_callable=g_callable,
+        )
+
+    mean_y = mean_y.to(device=device, dtype=torch.float32)
+    std_y = torch.clamp(std_y.to(device=device, dtype=torch.float32), min=1e-6)
+
+    for X, H1, H2, S3, y, teacher_3L in stream_batches_teacher_3layers_v2(
+        d=d,
+        p1=p1,
+        p2=p2,
+        n=n,
+        batch_size=batch_size,
+        A1_mode=A1_mode,
+        A2_mode=A2_mode,
+        A3_mode=A3_mode,
+        beta3=beta3,
+        gamma3=gamma3,
+        skip_mode=skip_mode,
+        skip_scale1=skip_scale1,
+        skip_scale2=skip_scale2,
+        seed=seed,
+        device=device,
+        g_name=g_name,
+        g_callable=g_callable,
+    ):
+        y_norm = (y - mean_y) / std_y
+        yield X, H1, H2, S3, y_norm, teacher_3L
+
 
 
