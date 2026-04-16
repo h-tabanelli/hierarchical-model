@@ -39,6 +39,9 @@ EXPS = [
     {"label": r"$\gamma=0.4$", "exp_id": "D400_eps05_g04_v2"},
     {"label": r"$\gamma=1.0$", "exp_id": "D400_eps05_g10_v2"},
     {"label": r"$\gamma=0.0$", "exp_id": "D400_eps05_g00_v2"},
+    {"label": r"$\gamma=0.0$", "exp_id": "D400_eps05_g02_v2"},
+    {"label": r"$\gamma=0.0$", "exp_id": "D400_eps05_g06_v2"},
+    {"label": r"$\gamma=0.0$", "exp_id": "D400_eps05_g06_v2"},
 ]
 
 # plotting style

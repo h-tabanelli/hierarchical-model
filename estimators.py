@@ -415,6 +415,237 @@ def compute_hhat_from_X_and_Ahat(X, Ahat):
     hhat = (q - trA[None, :]) / math.sqrt(2.0)
     return hhat
 
+def _apply_rf_activation(U: torch.Tensor, rf_activation: str):
+    rf_activation = str(rf_activation)
+    if rf_activation in {"id", "identity", "linear"}:
+        return U
+    if rf_activation == "relu":
+        return torch.relu(U) - (1.0 / math.sqrt(2.0 * math.pi)) - 0.5 * U
+    if rf_activation == "tanh":
+        return torch.tanh(U)
+    if rf_activation == "erf":
+        return torch.erf(U)
+    raise ValueError(f"Unknown rf_activation: {rf_activation}")
+
+
+@torch.no_grad()
+def init_rf_layer(
+    d: int,
+    rf_width: int,
+    rf_activation: str = "relu",
+    seed: int = 0,
+    device=None,
+    dtype=torch.float32,
+):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(seed))
+    W = torch.randn(int(rf_width), int(d), generator=gen, device=device, dtype=dtype)
+    W = W / math.sqrt(float(d))
+    return {"W": W, "rf_activation": str(rf_activation)}
+
+
+@torch.no_grad()
+def apply_rf_layer(X: torch.Tensor, rf_layer: dict, device=None, dtype=torch.float32):
+    if device is None:
+        device = X.device
+    X = X.to(device=device, dtype=dtype)
+    W = rf_layer["W"].to(device=device, dtype=dtype)
+    U = X @ W.T
+    return _apply_rf_activation(U, rf_layer["rf_activation"])
+
+
+@torch.no_grad()
+def compute_hhat_from_X_and_rf(
+    X: torch.Tensor,
+    rf_layer: dict,
+    Vhat: torch.Tensor,
+    device=None,
+    dtype=torch.float32,
+):
+    S = apply_rf_layer(X, rf_layer=rf_layer, device=device, dtype=dtype)  # (bs, rf_width)
+    Vhat = Vhat.to(device=S.device, dtype=S.dtype)                         # (p, rf_width)
+    return S @ Vhat.T                                                     # (bs, p)
+
+
+@torch.no_grad()
+def compute_hhat_from_X_and_rf_whitened(
+    X: torch.Tensor,
+    rf_layer: dict,
+    Vhat: torch.Tensor,
+    whiten_mu_cpu: torch.Tensor,
+    whiten_mat_cpu: torch.Tensor,
+    device=None,
+    dtype=torch.float32,
+):
+    Hraw = compute_hhat_from_X_and_rf(
+        X, rf_layer=rf_layer, Vhat=Vhat, device=device, dtype=dtype
+    )
+    Hwhite = apply_whitening_to_H(
+        Hraw, whiten_mu_cpu, whiten_mat_cpu, device=device, dtype=dtype
+    )
+    return Hwhite
+
+@torch.no_grad()
+def estimate_whitening_from_H_stream(
+    stream_fn,
+    p: int,
+    device=None,
+    eps: float = 1e-6,
+):
+    """
+    Given a stream yielding (H, y) with H shape (bs,p), estimate:
+      mu   = E[H]
+      Sigma= Cov(H)
+      W    = Sigma^{-1/2}
+    Returns CPU tensors: mu_cpu, Sigma_cpu, Wwhite_cpu
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ---- pass 1: mean ----
+    h_sum = torch.zeros(p, device=device, dtype=torch.float32)
+    count = 0
+    for H, _ in stream_fn():
+        H = H.to(device=device, dtype=torch.float32)
+        h_sum += H.sum(dim=0)
+        count += H.shape[0]
+    if count == 0:
+        raise ValueError("estimate_whitening_from_H_stream: empty stream")
+    mu = h_sum / float(count)
+
+    # ---- pass 2: covariance ----
+    Sigma = torch.zeros((p, p), device=device, dtype=torch.float32)
+    for H, _ in stream_fn():
+        H = H.to(device=device, dtype=torch.float32)
+        Hc = H - mu[None, :]
+        Sigma += Hc.T @ Hc
+    Sigma /= float(count)
+
+    # regularized inverse square root
+    evals, evecs = torch.linalg.eigh(Sigma)
+    evals = torch.clamp(evals, min=float(eps))
+    Winvhalf = evecs @ torch.diag(evals.rsqrt()) @ evecs.T
+    Winvhalf = 0.5 * (Winvhalf + Winvhalf.T)
+
+    return mu.detach().cpu(), Sigma.detach().cpu(), Winvhalf.detach().cpu()
+
+
+@torch.no_grad()
+def apply_whitening_to_H(
+    H: torch.Tensor,
+    mu_cpu: torch.Tensor,
+    Wwhite_cpu: torch.Tensor,
+    device=None,
+    dtype=torch.float32,
+):
+    if device is None:
+        device = H.device
+    H = H.to(device=device, dtype=dtype)
+    mu = mu_cpu.to(device=device, dtype=dtype)
+    Wwhite = Wwhite_cpu.to(device=device, dtype=dtype)
+    Hc = H - mu[None, :]
+    return Hc @ Wwhite.T
+
+@torch.no_grad()
+def fit_rf_spectral_layer1_from_stream(
+    stream_fn_factory,
+    d: int,
+    rf_width: int,
+    p_out: int,
+    n_total: int,
+    rf_activation: str = "relu",
+    rf_seed: int = 0,
+    n_iter: int = 10,
+    oversamp: int = 10,
+    device=None,
+    Q_init=None,
+    T_min: int = 0,
+    stop_tol=None,
+    return_Q_full: bool = False,
+    return_info: bool = False,
+):
+    """
+    Fit top-p_out eigenvectors of
+        C_rf = (1/n) sum_mu y_mu s_mu s_mu^T - mean(y) I
+    where s_mu = sigma(W x_mu), W random frozen.
+
+    Returns:
+      rf_layer, Vhat
+    and optionally Q_full, info
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    rf_width = int(rf_width)
+    p_out = int(p_out)
+    k = p_out + int(oversamp)
+    T_max = int(n_iter)
+    T_min = int(T_min)
+
+    rf_layer = init_rf_layer(
+        d=int(d),
+        rf_width=rf_width,
+        rf_activation=rf_activation,
+        seed=int(rf_seed),
+        device=device,
+        dtype=torch.float32,
+    )
+
+    if Q_init is None:
+        Q = torch.randn(k, rf_width, device=device, dtype=torch.float32)
+    else:
+        Q0 = Q_init.to(device=device, dtype=torch.float32)
+        if Q0.dim() != 2 or Q0.shape[1] != rf_width:
+            raise ValueError(f"Q_init must have shape (k, rf_width={rf_width}). Got {tuple(Q0.shape)}")
+        if Q0.shape[0] < k:
+            pad = torch.randn(k - Q0.shape[0], rf_width, device=device, dtype=torch.float32)
+            Q = torch.cat([Q0, pad], dim=0)
+        else:
+            Q = Q0[:k]
+    Q = row_orthonormalize(Q)
+
+    def rf_stream():
+        for X, y in stream_fn_factory()():
+            X = X.to(device=device, dtype=torch.float32)
+            y = y.to(device=device, dtype=torch.float32)
+            S = apply_rf_layer(X, rf_layer=rf_layer, device=device, dtype=torch.float32)
+            yield S, y
+
+    prev_Qp = None
+    last_delta = None
+    n_iter_effective = 0
+
+    for t in range(T_max):
+        CQ = C_apply_vec(rf_stream, Q, m=rf_width, n_total=n_total, device=device)
+        Q = row_orthonormalize(CQ.to(torch.float32))
+        n_iter_effective = t + 1
+
+        if stop_tol is not None:
+            Qp = Q[:p_out].to(torch.float64)
+            if prev_Qp is not None:
+                M = Qp @ prev_Qp.T
+                I = torch.eye(p_out, device=M.device, dtype=M.dtype)
+                delta = torch.linalg.norm(I - (M @ M.T), ord="fro").item()
+                last_delta = float(delta)
+                if (t + 1) >= T_min and delta <= float(stop_tol):
+                    break
+            prev_Qp = Qp.clone()
+
+    Vhat = Q[:p_out].contiguous()
+    info = {
+        "n_iter_effective": int(n_iter_effective),
+        "stop_delta": None if last_delta is None else float(last_delta),
+        "loaded_Ahat": False,
+    }
+
+    outs = [rf_layer, Vhat]
+    if return_Q_full:
+        outs.append(Q.contiguous())
+    if return_info:
+        outs.append(info)
+    return tuple(outs) if len(outs) > 1 else outs[0]
 
 @torch.no_grad()
 def estimate_Bhat_from_stream(stream_fn, Ahat, p, n_total, device=None, dtype=torch.float32):
@@ -509,6 +740,27 @@ def fit_polynomial_link(y0, y, degree=5, ridge=1e-6):
 
     return coeffs, (mu, sig)
 
+@torch.no_grad()
+def fit_affine_link(s_train, y_train):
+    """
+    Fit y ≈ a*s + b by least squares.
+    Inputs are 1D numpy arrays.
+    Returns floats (a, b).
+    """
+    s = np.asarray(s_train, dtype=np.float64).reshape(-1)
+    y = np.asarray(y_train, dtype=np.float64).reshape(-1)
+
+    X = np.column_stack([s, np.ones_like(s)])
+    coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+    a, b = coef
+    return float(a), float(b)
+
+
+@torch.no_grad()
+def predict_affine_link(s, a, b):
+    s = np.asarray(s, dtype=np.float64)
+    return a * s + b
+
 
 @torch.no_grad()
 def estimate_Bhat_from_H_stream(stream_fn, p, n_total, device=None, dtype=torch.float32):
@@ -541,6 +793,70 @@ def estimate_Bhat_from_H_stream(stream_fn, p, n_total, device=None, dtype=torch.
     Bhat = 0.5 * (Bhat + Bhat.T)
     return Bhat.cpu()
 
+@torch.no_grad()
+def estimate_Bhat_from_H_stream_nonisotropic(
+    stream_fn,
+    p: int,
+    n_total: int,
+    device=None,
+    return_stats: bool = False,
+):
+    """
+    Estimate
+        Bhat = (1/n) sum_mu y_mu [ (h_mu - m)(h_mu - m)^T - Sigma ]
+    where
+        m     = (1/n) sum_mu h_mu
+        Sigma = (1/n) sum_mu (h_mu - m)(h_mu - m)^T
+
+    stream_fn must yield (H_batch, y_batch), with H_batch shape (bs, p), y_batch shape (bs,).
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ---- pass 1: mean of h ----
+    h_sum = torch.zeros(p, device=device, dtype=torch.float32)
+    count = 0
+    for H, _ in stream_fn():
+        H = H.to(device=device, dtype=torch.float32)
+        h_sum += H.sum(dim=0)
+        count += H.shape[0]
+    if count == 0:
+        raise ValueError("estimate_Bhat_from_H_stream_nonisotropic: empty stream")
+    h_mean = h_sum / float(count)
+
+    # ---- pass 2: covariance of h and weighted centered second moment ----
+    Sigma = torch.zeros((p, p), device=device, dtype=torch.float32)
+    Bhat = torch.zeros((p, p), device=device, dtype=torch.float32)
+    y_sum = 0.0
+    y_count = 0
+
+    for H, y in stream_fn():
+        H = H.to(device=device, dtype=torch.float32)
+        y = y.to(device=device, dtype=torch.float32)
+        Hc = H - h_mean[None, :]
+
+        Sigma += Hc.T @ Hc
+        Bhat += Hc.T @ (Hc * y[:, None])
+
+        y_sum += y.sum().item()
+        y_count += y.numel()
+
+    Sigma /= float(count)
+    Bhat /= float(count)
+    y_mean = y_sum / max(y_count, 1)
+
+    Bhat = Bhat - float(y_mean) * Sigma
+    Bhat = 0.5 * (Bhat + Bhat.T)
+
+    Bhat_cpu = Bhat.detach().cpu()
+    if not return_stats:
+        return Bhat_cpu
+
+    return (
+        Bhat_cpu,
+        h_mean.detach().cpu(),
+        Sigma.detach().cpu(),
+    )
 
 def predict_polynomial_link(y0, coeffs, mu_sig=None):
     import numpy as _np

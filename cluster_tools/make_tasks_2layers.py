@@ -90,7 +90,12 @@ def main() -> None:
 
     ap.add_argument("--fit_degree", type=int, default=5)
     ap.add_argument("--fit_ridge", type=float, default=1e-6)
-    ap.add_argument("--head_mode", type=str, default="spectral_B", choices=["spectral_B", "latent_rbf", "input_rbf"])
+    ap.add_argument(
+        "--head_mode",
+        type=str,
+        default="spectral_B",
+        choices=["spectral_B", "latent_rbf", "input_rbf", "latent_poly2", "input_poly4_rf"],
+    )
     ap.add_argument("--n_krr_max", type=int, default=4000)
     ap.add_argument("--rbf_lambda", type=float, default=1e-4)
     ap.add_argument("--rbf_sigma_mult", type=float, default=1.0)
@@ -98,6 +103,10 @@ def main() -> None:
     ap.add_argument("--no_rbf_standardize", dest="rbf_standardize", action="store_false")
     ap.add_argument("--poly_lambda", type=float, default=1e-4)
     ap.add_argument("--m_rf", type=int, default=1024)
+    ap.add_argument("--layer1_mode", type=str, default="hermite_spectral",
+                choices=["hermite_spectral", "rf_spectral"])
+    ap.add_argument("--rf_width", type=int, default=8192)
+    ap.add_argument("--rf_activation", type=str, default="relu")
 
     ap.add_argument("--load_ahat_exp_id", type=str, default="")
 
@@ -140,6 +149,9 @@ def main() -> None:
                 "fit_degree": int(args.fit_degree),
                 "fit_ridge": float(args.fit_ridge),
                 "head_mode": str(args.head_mode),
+                "layer1_mode": str(args.layer1_mode),
+                "rf_width": int(args.rf_width),
+                "rf_activation": str(args.rf_activation),
                 "n_krr_max": int(args.n_krr_max),
                 "rbf_lambda": float(args.rbf_lambda),
                 "rbf_sigma_mult": float(args.rbf_sigma_mult),
