@@ -108,6 +108,10 @@ def main() -> None:
     ap.add_argument("--rf_width", type=int, default=8192)
     ap.add_argument("--rf_activation", type=str, default="relu")
 
+    ap.add_argument("--calibrate_output", action="store_true")
+    ap.add_argument("--no_calibrate_output", dest="calibrate_output", action="store_false")
+    ap.set_defaults(calibrate_output=False)
+
     ap.add_argument("--load_ahat_exp_id", type=str, default="")
 
     args = ap.parse_args()
@@ -158,6 +162,7 @@ def main() -> None:
                 "rbf_standardize": bool(args.rbf_standardize),
                 "poly_lambda": float(args.poly_lambda),
                 "m_rf": int(args.m_rf),
+                "calibrate_output": bool(args.calibrate_output),
                 "load_ahat_exp_id": None if args.load_ahat_exp_id == "" else str(args.load_ahat_exp_id),
             }
             lines.append(json.dumps(task))

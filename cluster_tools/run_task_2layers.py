@@ -76,17 +76,6 @@ def _raw_pred_from_Hhat(Hhat, Bhat_cpu, device):
     s = torch.einsum("bp,pq,bq->b", Hhat, Bhat_t, Hhat) - trB
     return s
 
-def _raw_pred_from_Hhat_nonisotropic(Hhat, Bhat_cpu, hhat_mean_cpu, hhat_cov_cpu, device):
-    Hhat = Hhat.to(device=device, dtype=torch.float32)
-    Bhat_t = Bhat_cpu.to(device=device, dtype=torch.float32)
-    mu = hhat_mean_cpu.to(device=device, dtype=torch.float32)
-    Sigma = hhat_cov_cpu.to(device=device, dtype=torch.float32)
-
-    Hc = Hhat - mu[None, :]
-    quad = torch.einsum("bp,pq,bq->b", Hc, Bhat_t, Hc)
-    offset = torch.sum(Bhat_t * Sigma)
-    return quad - offset
-
 def _maybe_load_saved_Ahat(
     outdir_root: Path,
     source_exp_id: str | None,
@@ -160,6 +149,7 @@ def _run_one_alpha_model(
     layer1_mode: str = "hermite_spectral",
     rf_width: int = 8192,
     rf_activation: str = "relu",
+    calibrate_output: bool,
 ) -> tuple[dict, torch.Tensor | None]:
     """Run a single (alpha, model) and return (metrics_dict, Q_full_for_warm_start)."""
     t0 = time.time()
@@ -170,8 +160,6 @@ def _run_one_alpha_model(
     Ahat = None
     Vhat = None
     rf_layer = None
-    hhat_mean = None
-    hhat_cov = None
     whiten_mu = None
     whiten_cov = None
     whiten_mat = None
@@ -312,12 +300,13 @@ def _run_one_alpha_model(
     rf_map = None
     affine_a = None
     affine_b = None
-    score_mean = None
-    score_std = None
     
     n_batches = (n + batch_size - 1) // batch_size
 
-    if layer1_mode == "rf_spectral":
+    calib_skip_batches = 0
+    calib_take_batches = 0
+
+    if calibrate_output and layer1_mode == "rf_spectral":
         calib_skip_batches = min(20, max(0, n_batches // 5))
         calib_take_batches = min(100, max(1, n_batches - calib_skip_batches))
 
@@ -372,62 +361,80 @@ def _run_one_alpha_model(
                 stream_fn=Hhat_stream, p=p, n_total=n, device=device
             )
 
-        # ---- calibration / link ----
+        # ---- optional calibration / link ----
         if layer1_mode == "rf_spectral":
-            s_list, y_list = [], []
-            for j, (X_or_Z, y_norm) in enumerate(stream_fn_factory()()):
-                if j < calib_skip_batches:
-                    continue
-                if j >= calib_skip_batches + calib_take_batches:
-                    break
+            if calibrate_output:
+                s_list, y_list = [], []
+                for j, (X_or_Z, y_norm) in enumerate(stream_fn_factory()()):
+                    if j < calib_skip_batches:
+                        continue
+                    if j >= calib_skip_batches + calib_take_batches:
+                        break
 
-                Hhat_tmp = estimators.compute_hhat_from_X_and_rf_whitened(
-                    X_or_Z.to(device=device, dtype=torch.float32),
-                    rf_layer=rf_layer,
-                    Vhat=Vhat,
-                    whiten_mu_cpu=whiten_mu,
-                    whiten_mat_cpu=whiten_mat,
-                    device=device,
-                )
-                s = _raw_pred_from_Hhat(Hhat_tmp, Bhat_cpu, device)
+                    Hhat_tmp = estimators.compute_hhat_from_X_and_rf_whitened(
+                        X_or_Z.to(device=device, dtype=torch.float32),
+                        rf_layer=rf_layer,
+                        Vhat=Vhat,
+                        whiten_mu_cpu=whiten_mu,
+                        whiten_mat_cpu=whiten_mat,
+                        device=device,
+                    )
+                    s = _raw_pred_from_Hhat(Hhat_tmp, Bhat_cpu, device)
 
-                s_list.append(s.detach().cpu().numpy())
-                y_list.append(y_norm.detach().cpu().numpy())
+                    s_list.append(s.detach().cpu().numpy())
+                    y_list.append(y_norm.detach().cpu().numpy())
 
-            if len(s_list) == 0:
-                affine_a, affine_b = None, None
-                use_affine = False
-            else:
-                s_cal = np.concatenate(s_list, axis=0)
-                y_cal = np.concatenate(y_list, axis=0)
-                affine_a, affine_b = estimators.fit_affine_link(s_cal, y_cal)
-                use_affine = True
+                if len(s_list) > 0:
+                    s_cal = np.concatenate(s_list, axis=0)
+                    y_cal = np.concatenate(y_list, axis=0)
+                    affine_a, affine_b = estimators.fit_affine_link(s_cal, y_cal)
 
         else:
             if is_id:
+                # legacy variance rescaling: keep it
                 s_list = []
+                scale_take_batches = min(2, n_batches)
                 for j, (X_or_Z, _) in enumerate(stream_fn_factory()()):
                     s = _raw_pred_from_input(X_or_Z, Ahat, Bhat_cpu, model, device)
                     s_list.append(s.detach().cpu().numpy())
-                    if j + 1 >= 2:
+                    if j + 1 >= scale_take_batches:
                         break
-                s_cal = np.concatenate(s_list, axis=0)
-                scale = 1.0 / (np.std(s_cal) + 1e-12)
-                Bhat_cpu = Bhat_cpu * float(scale)
+                if len(s_list) > 0:
+                    s_cal = np.concatenate(s_list, axis=0)
+                    scale = 1.0 / (np.std(s_cal) + 1e-12)
+                    Bhat_cpu = Bhat_cpu * float(scale)
+
+                # optional affine calibration on top
+                if calibrate_output:
+                    s_list, y_list = [], []
+                    affine_take_batches = min(10, n_batches)
+                    for j, (X_or_Z, y_norm) in enumerate(stream_fn_factory()()):
+                        s = _raw_pred_from_input(X_or_Z, Ahat, Bhat_cpu, model, device)
+                        s_list.append(s.detach().cpu().numpy())
+                        y_list.append(y_norm.detach().cpu().numpy())
+                        if j + 1 >= affine_take_batches:
+                            break
+                    if len(s_list) > 0:
+                        s_fit = np.concatenate(s_list, axis=0)
+                        y_fit = np.concatenate(y_list, axis=0)
+                        affine_a, affine_b = estimators.fit_affine_link(s_fit, y_fit)
 
             else:
-                s_list, y_list = [], []
-                for j, (X_or_Z, y_norm) in enumerate(stream_fn_factory()()):
-                    s = _raw_pred_from_input(X_or_Z, Ahat, Bhat_cpu, model, device)
-                    s_list.append(s.detach().cpu().numpy())
-                    y_list.append(y_norm.detach().cpu().numpy())
-                    if j + 1 >= 10:
-                        break
-                s_fit = np.concatenate(s_list, axis=0)
-                y_fit = np.concatenate(y_list, axis=0)
-                coeffs, mu_sig = estimators.fit_polynomial_link(
-                    s_fit, y_fit, degree=fit_degree, ridge=fit_ridge
-                )
+                if calibrate_output:
+                    s_list, y_list = [], []
+                    poly_take_batches = min(10, n_batches)
+                    for j, (X_or_Z, y_norm) in enumerate(stream_fn_factory()()):
+                        s = _raw_pred_from_input(X_or_Z, Ahat, Bhat_cpu, model, device)
+                        s_list.append(s.detach().cpu().numpy())
+                        y_list.append(y_norm.detach().cpu().numpy())
+                        if j + 1 >= poly_take_batches:
+                            break
+                    if len(s_list) > 0:
+                        s_fit = np.concatenate(s_list, axis=0)
+                        y_fit = np.concatenate(y_list, axis=0)
+                        coeffs, mu_sig = estimators.fit_polynomial_link(
+                            s_fit, y_fit, degree=fit_degree, ridge=fit_ridge
+                        )
 
     elif head_mode == "latent_poly2":
         if not needs_Ahat:
@@ -566,6 +573,9 @@ def _run_one_alpha_model(
 
             "affine_a": affine_a,
             "affine_b": affine_b,
+
+            "poly_coeffs": None if coeffs is None else np.asarray(coeffs, dtype=np.float64),
+            "poly_mu_sig": None if mu_sig is None else (float(mu_sig[0]), float(mu_sig[1])),
         }
         torch.save(payload, artdir / "estimates.pt")
 
@@ -592,10 +602,21 @@ def _run_one_alpha_model(
             s_test = _raw_pred_from_Hhat(Hte_hat, Bhat_cpu, device).detach().cpu().numpy()
 
         if layer1_mode == "rf_spectral":
-            if affine_a is not None and affine_b is not None:
+            if calibrate_output and affine_a is not None and affine_b is not None:
                 yhat = estimators.predict_affine_link(s_test, affine_a, affine_b)
             else:
                 yhat = s_test
+        else:
+            if is_id:
+                if calibrate_output and affine_a is not None and affine_b is not None:
+                    yhat = estimators.predict_affine_link(s_test, affine_a, affine_b)
+                else:
+                    yhat = s_test
+            else:
+                if calibrate_output and coeffs is not None:
+                    yhat = estimators.predict_polynomial_link(s_test, coeffs, mu_sig=mu_sig)
+                else:
+                    yhat = s_test
 
     elif head_mode in {"latent_rbf", "input_rbf"}:
         if not needs_Ahat:
@@ -721,10 +742,12 @@ def _run_one_alpha_model(
         "nmse_scaled": nmse_scaled,
         "affine_a": None if affine_a is None else float(affine_a),
         "affine_b": None if affine_b is None else float(affine_b),
-        "score_mean": None if score_mean is None else float(score_mean),
-        "score_std": None if score_std is None else float(score_std),
         "calib_skip_batches": int(calib_skip_batches),
         "calib_take_batches": int(calib_take_batches),
+        "calibrate_output": bool(calibrate_output),
+        "poly_coeffs_present": bool(coeffs is not None),
+        "poly_mu": None if mu_sig is None else float(mu_sig[0]),
+        "poly_sig": None if mu_sig is None else float(mu_sig[1]),
         "wall_seconds": float(time.time() - t0),
         "device": str(device),
     }
@@ -792,6 +815,7 @@ def main() -> None:
     layer1_mode = str(task.get("layer1_mode", "hermite_spectral"))
     rf_width = int(task.get("rf_width", 8192))
     rf_activation = str(task.get("rf_activation", "relu"))
+    calibrate_output = bool(task.get("calibrate_output", False))
 
     load_ahat_exp_id = task.get("load_ahat_exp_id", None)
     if load_ahat_exp_id in {"", "none", "null"}:
