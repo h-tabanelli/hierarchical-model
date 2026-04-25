@@ -880,6 +880,7 @@ def main() -> None:
                     layer1_mode=layer1_mode,
                     rf_width=rf_width,
                     rf_activation=rf_activation,
+                    calibrate_output=calibrate_output,
                 )
 
                 if Q_full is not None:

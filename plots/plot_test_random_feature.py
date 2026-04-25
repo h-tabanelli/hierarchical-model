@@ -89,6 +89,14 @@ EXP_GLOB = "results/rf_d*_final_calib/**/*.jsonl"
 
 fig, axes, df = plot_rf_two_panels(EXP_GLOB)
 
+plt.suptitle(
+    r"Random feature extension," "\n"
+    r"$\epsilon=0.5$, $d_1=d^{\epsilon}$, "
+    r"$\sigma(u)=\mathrm{ReLU}(u)-\frac{1}{\sqrt{2\pi}}-\frac{1}{2}u$" "\n"
+    r"RF width $P\in\{30000,45000,60000,80000\}$ for $d\in\{80,100,120,140\}$",
+    y=1.15
+)
+
 Path("figures/rf").mkdir(parents=True, exist_ok=True)
 plt.savefig("figures/rf/rf_all_d_two_panels.png", dpi=200, bbox_inches="tight")
 plt.show()
