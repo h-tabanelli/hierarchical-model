@@ -94,7 +94,7 @@ def main() -> None:
         "--head_mode",
         type=str,
         default="spectral_B",
-        choices=["spectral_B", "latent_rbf", "input_rbf", "latent_poly2", "input_poly4_rf"],
+        choices=["spectral_B", "latent_rbf", "input_rbf", "latent_poly2", "input_poly4_rf", "latent_rf_spectral"],
     )
     ap.add_argument("--n_krr_max", type=int, default=4000)
     ap.add_argument("--rbf_lambda", type=float, default=1e-4)
@@ -107,6 +107,12 @@ def main() -> None:
                 choices=["hermite_spectral", "rf_spectral"])
     ap.add_argument("--rf_width", type=int, default=8192)
     ap.add_argument("--rf_activation", type=str, default="relu")
+    ap.add_argument("--rf2_width", type=int, default=4096)
+    ap.add_argument("--rf2_activation", type=str, default="relu_raw")
+    ap.add_argument("--rf2_affine_ridge", type=float, default=1e-6)
+    ap.add_argument("--rf2_use_whiten", action="store_true")
+    ap.add_argument("--no_rf2_use_whiten", dest="rf2_use_whiten", action="store_false")
+    ap.set_defaults(rf2_use_whiten=True)
 
     ap.add_argument("--calibrate_output", action="store_true")
     ap.add_argument("--no_calibrate_output", dest="calibrate_output", action="store_false")
@@ -156,6 +162,9 @@ def main() -> None:
                 "layer1_mode": str(args.layer1_mode),
                 "rf_width": int(args.rf_width),
                 "rf_activation": str(args.rf_activation),
+                "rf2_width": int(args.rf2_width),
+                "rf2_activation": str(args.rf2_activation),
+                "rf2_affine_ridge": float(args.rf2_affine_ridge),
                 "n_krr_max": int(args.n_krr_max),
                 "rbf_lambda": float(args.rbf_lambda),
                 "rbf_sigma_mult": float(args.rbf_sigma_mult),

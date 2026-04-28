@@ -45,7 +45,7 @@ def plot_rf_two_panels(path_glob: str,
 
     # déduplication
     dedup_cols = ["d", "alpha", "seed", "model", "head_mode", "layer1_mode"]
-    for col in ["rf_width", "rf_activation"]:
+    for col in ["rf_width", "rf_activation", "rf2_width", "rf2_activation", "rf2_use_whiten", "calibrate_output"]:
         if col in df.columns:
             dedup_cols.append(col)
 
@@ -84,21 +84,26 @@ def plot_rf_two_panels(path_glob: str,
     fig.tight_layout()
     return fig, axes, df
 
+G_star = "tanh"
+EXP_GLOB = "results/rf2_"+str(G_star)+"_empirical*/**/*.jsonl"
 
-EXP_GLOB = "results/rf_d*_final_calib/**/*.jsonl"
-
-fig, axes, df = plot_rf_two_panels(EXP_GLOB)
+fig, axes, df = plot_rf_two_panels(EXP_GLOB,
+    model="true",
+    head_mode="latent_rf_spectral",
+    layer1_mode="rf_spectral",
+)
 
 plt.suptitle(
     r"Random feature extension," "\n"
-    r"$\epsilon=0.5$, $d_1=d^{\epsilon}$, "
+    r"$\epsilon=0.5$, $d_1=d^{\epsilon}$, $g^\star=$"+str(G_star)+",  "
     r"$\sigma(u)=\mathrm{ReLU}(u)-\frac{1}{\sqrt{2\pi}}-\frac{1}{2}u$" "\n"
-    r"RF width $P\in\{30000,45000,60000,80000\}$ for $d\in\{80,100,120,140\}$",
+    r"$p_1=8192$, $p_2=4096$",
     y=1.15
 )
 
 Path("figures/rf").mkdir(parents=True, exist_ok=True)
-plt.savefig("figures/rf/rf_all_d_two_panels.png", dpi=200, bbox_inches="tight")
+plt.savefig("figures/rf/rf2_"+str(G_star)+"_normalize_sigma_all_d_two_panels.png", dpi=200, bbox_inches="tight")
+plt.savefig("figures/rf/rf2_"+str(G_star)+"_normalize_sigma_all_d_two_panels.pdf", dpi=200, bbox_inches="tight")
 plt.show()
 
 # def plot_rf_run(

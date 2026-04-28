@@ -417,16 +417,24 @@ def compute_hhat_from_X_and_Ahat(X, Ahat):
 
 def _apply_rf_activation(U: torch.Tensor, rf_activation: str):
     rf_activation = str(rf_activation)
+    # plain linear
     if rf_activation in {"id", "identity", "linear"}:
         return U
-    if rf_activation == "relu":
+    # raw ReLU: keeps order 0 and order 1
+    if rf_activation in {"relu_raw", "relu_uncentered", "relu_plain"}:
+        return torch.relu(U)
+    # zero-mean ReLU: removes only order 0, keeps order 1
+    if rf_activation in {"relu_mean0", "relu_center0", "relu_zero_mean"}:
+        return torch.relu(U) - (1.0 / math.sqrt(2.0 * math.pi))
+    # old centered ReLU used for layer-1 RF:
+    # removes order 0 and order 1
+    if rf_activation in {"relu_l1", "relu_center01"}:
         return torch.relu(U) - (1.0 / math.sqrt(2.0 * math.pi)) - 0.5 * U
     if rf_activation == "tanh":
         return torch.tanh(U)
     if rf_activation == "erf":
         return torch.erf(U)
     raise ValueError(f"Unknown rf_activation: {rf_activation}")
-
 
 @torch.no_grad()
 def init_rf_layer(
@@ -646,6 +654,400 @@ def fit_rf_spectral_layer1_from_stream(
     if return_info:
         outs.append(info)
     return tuple(outs) if len(outs) > 1 else outs[0]
+
+# @torch.no_grad()
+# def fit_rf_linear_head_from_H_stream(
+#     stream_fn_factory,
+#     d_in: int,
+#     rf_width: int,
+#     n_total: int,
+#     rf_activation: str = "relu_center0",
+#     rf_seed: int = 0,
+#     device=None,
+# ):
+#     """
+#     Fit a linear RF head on latent features H:(bs,d_in).
+
+#     We build:
+#         ahat = (1/n) sum_mu y_mu r_mu
+#     with:
+#         r_mu = sigma(W H_mu),  W in R^{rf_width x d_in}
+
+#     Returns:
+#         rf_layer, ahat
+#     where ahat has shape (rf_width,).
+#     """
+#     if device is None:
+#         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+#     rf_layer = init_rf_layer(
+#         d=int(d_in),
+#         rf_width=int(rf_width),
+#         rf_activation=rf_activation,
+#         seed=int(rf_seed),
+#         device=device,
+#         dtype=torch.float32,
+#     )
+
+#     ahat = torch.zeros(int(rf_width), device=device, dtype=torch.float32)
+#     n_seen = 0
+
+#     for H, y in stream_fn_factory()():
+#         H = H.to(device=device, dtype=torch.float32)
+#         y = y.to(device=device, dtype=torch.float32).reshape(-1)
+
+#         R = apply_rf_layer(H, rf_layer=rf_layer, device=device, dtype=torch.float32)
+#         ahat += R.T @ y
+#         n_seen += int(H.shape[0])
+
+#     denom = float(int(n_total) if int(n_total) > 0 else n_seen)
+#     ahat /= denom
+#     return rf_layer, ahat.contiguous()
+
+
+# @torch.no_grad()
+# def compute_h2hat_from_H_and_rf_linear_head(
+#     H: torch.Tensor,
+#     rf_head: dict,
+#     ahat: torch.Tensor,
+#     device=None,
+#     dtype=torch.float32,
+# ):
+#     """
+#     H:    (bs,d_in)
+#     ahat: (rf_width,)
+#     returns scalar latent h2hat: (bs,)
+#     """
+#     R = apply_rf_layer(H, rf_layer=rf_head, device=device, dtype=dtype)
+#     a = ahat.to(device=R.device, dtype=R.dtype).reshape(-1)
+#     return R @ a
+
+@torch.no_grad()
+def fit_rf_empirical_order01_linear_head_from_H_stream(
+    stream_fn_factory,
+    d_in: int,
+    rf_width: int,
+    n_total: int,
+    rf_activation: str = "relu_empirical01",
+    rf_seed: int = 0,
+    device=None,
+    eps: float = 1e-8,
+):
+    """
+    Second-layer RF head without whitening / preactivation normalization.
+
+    For each RF feature j:
+        u_j = w_j^T h
+        r_j = ReLU(u_j) - a_j - b_j u_j
+
+    where a_j and b_j are estimated empirically on the train stream:
+        a_j = E[ReLU(u_j)]
+        b_j = E[ReLU(u_j) u_j] / E[u_j^2]
+
+    Then:
+        ahat = (1/n) sum y * r
+
+    Returns:
+        rf_layer, a0, b1, ahat
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if str(rf_activation) not in {"relu_empirical01"}:
+        raise ValueError(
+            f"fit_rf_empirical_order01_linear_head_from_H_stream expects "
+            f"rf_activation='relu_empirical01', got {rf_activation}"
+        )
+
+    rf_layer = init_rf_layer(
+        d=int(d_in),
+        rf_width=int(rf_width),
+        rf_activation=str(rf_activation),
+        seed=int(rf_seed),
+        device=device,
+        dtype=torch.float32,
+    )
+
+    W = rf_layer["W"].to(device=device, dtype=torch.float32)
+
+    # ---------- pass 1: empirical order-0 / order-1 coefficients ----------
+    sum_relu = torch.zeros(int(rf_width), device=device, dtype=torch.float32)
+    sum_relu_u = torch.zeros(int(rf_width), device=device, dtype=torch.float32)
+    sum_u2 = torch.zeros(int(rf_width), device=device, dtype=torch.float32)
+    n_seen = 0
+
+    for H, _ in stream_fn_factory()():
+        H = H.to(device=device, dtype=torch.float32)
+        U = H @ W.T                            # (bs, rf_width)
+        RU = torch.relu(U)                     # raw ReLU
+
+        if n_seen == 0:
+            print("[RF2] U mean/std =", U.mean().item(), U.std().item())
+            print("[RF2] U absmax    =", U.abs().max().item())
+            print("[RF2] U per-dim std mean/min/max =",
+                U.std(dim=0).mean().item(),
+                U.std(dim=0).min().item(),
+                U.std(dim=0).max().item())
+            print("[RF2] ReLU(U) mean/std =", RU.mean().item(), RU.std().item())
+
+        sum_relu += RU.sum(dim=0)
+        sum_relu_u += (RU * U).sum(dim=0)
+        sum_u2 += (U * U).sum(dim=0)
+        n_seen += int(H.shape[0])
+
+    denom_n = float(int(n_total) if int(n_total) > 0 else n_seen)
+    a0 = sum_relu / denom_n
+    denom_u2 = torch.clamp(sum_u2, min=float(eps) * max(1, n_seen))
+    b1 = sum_relu_u / denom_u2
+
+    print("[RF2] a0 mean/std/min/max =",
+        a0.mean().item(), a0.std().item(), a0.min().item(), a0.max().item())
+    print("[RF2] b1 mean/std/min/max =",
+        b1.mean().item(), b1.std().item(), b1.min().item(), b1.max().item())
+    print("[RF2] sum_u2 min/max =",
+        sum_u2.min().item(), sum_u2.max().item())
+
+    # ---------- pass 2: linear estimator in corrected RF space ----------
+    ahat = torch.zeros(int(rf_width), device=device, dtype=torch.float32)
+
+    for H, y in stream_fn_factory()():
+        H = H.to(device=device, dtype=torch.float32)
+        y = y.to(device=device, dtype=torch.float32).reshape(-1)
+
+        U = H @ W.T
+        R = torch.relu(U) - a0[None, :] - b1[None, :] * U
+        ahat += R.T @ y
+
+    ahat /= denom_n
+    return rf_layer, a0.contiguous(), b1.contiguous(), ahat.contiguous()
+
+
+@torch.no_grad()
+def compute_rf_empirical_order01_features_from_H(
+    H: torch.Tensor,
+    rf_head: dict,
+    a0: torch.Tensor,
+    b1: torch.Tensor,
+    device=None,
+    dtype=torch.float32,
+):
+    """
+    Build corrected RF2 features:
+        r = ReLU(u) - a0 - b1 * u
+    with u = H W^T
+    """
+    if device is None:
+        device = H.device
+
+    H = H.to(device=device, dtype=dtype)
+    W = rf_head["W"].to(device=device, dtype=dtype)
+    a0 = a0.to(device=device, dtype=dtype).reshape(1, -1)
+    b1 = b1.to(device=device, dtype=dtype).reshape(1, -1)
+
+    U = H @ W.T
+    R = torch.relu(U) - a0 - b1 * U
+
+    print("[RF2] corrected R mean/std =", R.mean().item(), R.std().item())
+    print("[RF2] corrected R per-dim mean abs avg =",
+        R.mean(dim=0).abs().mean().item())
+    print("[RF2] corrected corr with U avg =",
+        ((R * U).mean(dim=0) / (U.pow(2).mean(dim=0) + 1e-8)).abs().mean().item())
+
+    return R
+
+
+@torch.no_grad()
+def compute_h2hat_from_H_and_rf_empirical_order01_linear_head(
+    H: torch.Tensor,
+    rf_head: dict,
+    a0: torch.Tensor,
+    b1: torch.Tensor,
+    ahat: torch.Tensor,
+    device=None,
+    dtype=torch.float32,
+):
+    """
+    Scalar second-layer latent:
+        h2hat = <ahat, r>
+    """
+    R = compute_rf_empirical_order01_features_from_H(
+        H, rf_head=rf_head, a0=a0, b1=b1, device=device, dtype=dtype
+    )
+    a = ahat.to(device=R.device, dtype=R.dtype).reshape(-1)
+    h2 = R @ a
+
+    print("[RF2] h2hat mean/std =", h2.mean().item(), h2.std().item())
+    print("[RF2] ahat mean/std/norm =",
+        a.mean().item(), a.std().item(), a.norm().item())
+    return h2
+
+@torch.no_grad()
+def fit_rf_vector_affine_removed_head_from_H_stream(
+    stream_fn_factory,
+    d_in: int,
+    rf_width: int,
+    n_total: int,
+    rf_activation: str = "relu_raw",
+    rf_seed: int = 0,
+    device=None,
+    ridge: float = 1e-6,
+):
+    """
+    Exact vector-valued affine removal in RF2 space.
+
+    For each sample:
+        H    : (bs, d_in)
+        U    = H W^T              in R^{bs x rf_width}
+        S    = sigma(U)           in R^{bs x rf_width}
+
+    We fit:
+        S ≈ a + U B^T
+    i.e.
+        R = S - a - U B^T
+
+    with
+        a in R^{rf_width}
+        B in R^{rf_width x rf_width}
+
+    Then:
+        ahat = (1/n) sum y R
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    rf_layer = init_rf_layer(
+        d=int(d_in),
+        rf_width=int(rf_width),
+        rf_activation=str(rf_activation),
+        seed=int(rf_seed),
+        device=device,
+        dtype=torch.float32,
+    )
+
+    W = rf_layer["W"].to(device=device, dtype=torch.float32)
+    m = int(rf_width)
+
+    # Accumulate moments on CPU in float64 for stability.
+    sum_u = torch.zeros(m, dtype=torch.float64, device="cpu")
+    sum_s = torch.zeros(m, dtype=torch.float64, device="cpu")
+    sum_uu = torch.zeros((m, m), dtype=torch.float64, device="cpu")
+    sum_su = torch.zeros((m, m), dtype=torch.float64, device="cpu")
+    n_seen = 0
+
+    # ---------- pass 1: fit affine vector regression S ≈ a + U B^T ----------
+    for H, _ in stream_fn_factory()():
+        H = H.to(device=device, dtype=torch.float32)
+        U = H @ W.T                                  # (bs, m)
+        S = _apply_rf_activation(U, str(rf_activation))  # (bs, m)
+
+        Uc = U.detach().to(device="cpu", dtype=torch.float64)
+        Sc = S.detach().to(device="cpu", dtype=torch.float64)
+
+        sum_u += Uc.sum(dim=0)
+        sum_s += Sc.sum(dim=0)
+        sum_uu += Uc.T @ Uc
+        sum_su += Sc.T @ Uc
+        n_seen += int(H.shape[0])
+
+    denom_n = float(int(n_total) if int(n_total) > 0 else n_seen)
+
+    m_u = sum_u / denom_n                           # (m,)
+    m_s = sum_s / denom_n                           # (m,)
+    M_uu = sum_uu / denom_n                         # (m,m)
+    M_su = sum_su / denom_n                         # (m,m)
+
+    C_uu = M_uu - torch.outer(m_u, m_u)            # (m,m)
+    C_su = M_su - torch.outer(m_s, m_u)            # (m,m)
+
+    A = C_uu + float(ridge) * torch.eye(m, dtype=torch.float64, device="cpu")
+
+    # We want B = C_su (C_uu + ridge I)^(-1)
+    # Solve A X = C_su^T, then B = X^T.
+    X = torch.linalg.solve(A, C_su.T)              # (m,m)
+    B_aff = X.T.contiguous()                       # (m,m)
+
+    a_aff = (m_s - B_aff @ m_u).contiguous()       # (m,)
+
+    # ---------- pass 2: build ahat = (1/n) sum y R ----------
+    ahat = torch.zeros(m, dtype=torch.float64, device="cpu")
+
+    B_aff_f32 = B_aff.to(dtype=torch.float32, device=device)
+    a_aff_f32 = a_aff.to(dtype=torch.float32, device=device)
+
+    for H, y in stream_fn_factory()():
+        H = H.to(device=device, dtype=torch.float32)
+        y = y.to(device=device, dtype=torch.float32).reshape(-1)
+
+        U = H @ W.T
+        S = _apply_rf_activation(U, str(rf_activation))
+        R = S - a_aff_f32[None, :] - U @ B_aff_f32.T
+
+        ahat += (R.T @ y).detach().to(device="cpu", dtype=torch.float64)
+
+    ahat /= denom_n
+
+    return (
+        rf_layer,
+        a_aff.contiguous(),                         # (m,)
+        B_aff.contiguous(),                         # (m,m)
+        ahat.contiguous(),                          # (m,)
+    )
+
+
+@torch.no_grad()
+def compute_rf_vector_affine_removed_features_from_H(
+    H: torch.Tensor,
+    rf_head: dict,
+    a_aff: torch.Tensor,
+    B_aff: torch.Tensor,
+    device=None,
+    dtype=torch.float32,
+):
+    """
+    Build exact vector-corrected RF2 features:
+        U = H W^T
+        S = sigma(U)
+        R = S - a - U B^T
+    """
+    if device is None:
+        device = H.device
+
+    H = H.to(device=device, dtype=dtype)
+    W = rf_head["W"].to(device=device, dtype=dtype)
+    U = H @ W.T
+    S = _apply_rf_activation(U, str(rf_head["rf_activation"]))
+
+    a = a_aff.to(device=device, dtype=dtype).reshape(1, -1)      # (1,m)
+    B = B_aff.to(device=device, dtype=dtype)                     # (m,m)
+
+    R = S - a - U @ B.T
+    return R
+
+
+@torch.no_grad()
+def compute_h2hat_from_H_and_rf_vector_affine_removed_linear_head(
+    H: torch.Tensor,
+    rf_head: dict,
+    a_aff: torch.Tensor,
+    B_aff: torch.Tensor,
+    ahat: torch.Tensor,
+    device=None,
+    dtype=torch.float32,
+):
+    """
+    Scalar second-layer feature:
+        h2hat = <ahat, R>
+    """
+    R = compute_rf_vector_affine_removed_features_from_H(
+        H,
+        rf_head=rf_head,
+        a_aff=a_aff,
+        B_aff=B_aff,
+        device=device,
+        dtype=dtype,
+    )
+    a = ahat.to(device=R.device, dtype=R.dtype).reshape(-1)
+    return R @ a
 
 @torch.no_grad()
 def estimate_Bhat_from_stream(stream_fn, Ahat, p, n_total, device=None, dtype=torch.float32):

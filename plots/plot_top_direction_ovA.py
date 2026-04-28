@@ -42,7 +42,7 @@ OUTNAME = "fig_ab_metric_and_ovA_topK_vs_alpha_by_exp"
 # Mets ici tes expériences (exp_id = nom du dossier results/<exp_id> et summary/<exp_id>)
 EXPS = [
     {"label": r"$\gamma=0.4$", "exp_id": "D400_eps05_g04_v2"},
-    {"label": r"$\gamma=1.0$", "exp_id": "D400_eps05_g10_v2"},
+    # {"label": r"$\gamma=1.0$", "exp_id": "D400_eps05_g10_v2"},
     # {"label": r"...", "exp_id": "..."},
 ]
 
@@ -277,7 +277,7 @@ def main():
 
     # Right: overlap on A top-K
     for c in curves:
-        line, = ax1.plot(c.alpha, c.ov_mean, linewidth=LINEWIDTH, label=c.label)
+        line, = ax1.plot(c.alpha, 1-c.ov_mean, linewidth=LINEWIDTH, label=c.label)
         col = line.get_color()
         if np.all(np.isfinite(c.ov_sem)):
             ax1.fill_between(c.alpha, c.ov_mean - c.ov_sem, c.ov_mean + c.ov_sem,

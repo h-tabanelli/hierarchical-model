@@ -36,11 +36,11 @@ OUTNAME = "ovA_principal_angles_cos2_vs_alpha"
 
 # experiments to compare (one plot per exp)
 EXPS = [
-    {"label": r"$\gamma=0.4$", "exp_id": "D400_eps05_g04_v2"},
+    {"label": r"$\gamma=0.6$", "exp_id": "D400_eps05_g04_v2"},
     {"label": r"$\gamma=1.0$", "exp_id": "D400_eps05_g10_v2"},
     {"label": r"$\gamma=0.0$", "exp_id": "D400_eps05_g00_v2"},
     {"label": r"$\gamma=0.0$", "exp_id": "D400_eps05_g02_v2"},
-    {"label": r"$\gamma=0.0$", "exp_id": "D400_eps05_g06_v2"},
+    # {"label": r"$\gamma=0.0$", "exp_id": "D400_eps05_g06_v2"},
     {"label": r"$\gamma=0.0$", "exp_id": "D400_eps05_g06_v2"},
 ]
 
@@ -249,18 +249,26 @@ def plot_one_exp(exp_id: str, label: str):
         else:
             alpha_th = 2 + 2 * gamma * np.log(i) / np.log(d)
 
-        line, = ax.plot(x, y, alpha=0.5, linewidth=LINEWIDTH, label=f"i={int(i)}")
+        line, = ax.plot(x, 1-np.sqrt(y), alpha=0.5, linewidth=LINEWIDTH, label=f"i={int(i)}")
         col = line.get_color()
 
         if np.all(np.isfinite(e)):
-            ax.fill_between(x, y - e, y + e, alpha=BAND_ALPHA, color=col)
+            ax.fill_between(x, 1-(np.sqrt(y) - e), 1-(np.sqrt(y) + e), alpha=BAND_ALPHA, color=col)
 
         if plot_th_tr:
             ax.axvline(alpha_th, color=col, linestyle="dashed", linewidth=0.8, alpha=0.7)
 
+    if gamma > 1/2:
+        ax.plot(x, np.exp((-1+1/(2*gamma + 1e-3))*(x-2)*np.log(d) + 0.1), color='k', linestyle="dashed", label=r"rate: $(-1+1/(2*\gamma))*\log (d)$")
+        ax.plot(x, np.exp((-1+1/(2*gamma + 1e-3))*(x-2) + 0.1), color='k', label=r"rate: $-1+1/(2*\gamma)$")
+    elif gamma <= 1/2: 
+        ax.plot(x, np.exp((1-1/(2*gamma + 1e-3))*(x-2)*np.log(d) + 0.1), color='r', linestyle="dashed", label=r"rate: $(1-1/(2*\gamma))*\log (d)$")
+        ax.plot(x, np.exp((1-1/(2*gamma + 1e-3))*(x-2) + 0.1), color='r', label=r"rate: $(1-1/(2*\gamma))$")
+
     ax.set_xlabel(r"$\alpha=\log(n)/\log(d)$")
     ax.set_ylabel(r"$\cos^2(\theta_i)$  (principal angles)")
-    ax.set_ylim(-0.02, 1.02)
+    ax.set_yscale("log")
+    ax.set_ylim(1e-4, 1.01)
     ax.grid(True, alpha=GRID_ALPHA)
 
     # legend outside
@@ -281,7 +289,8 @@ def plot_one_exp(exp_id: str, label: str):
         x2 = g_topk["alpha"].to_numpy(float)
         y2 = g_topk["topk_mean"].to_numpy(float)
 
-        ax2.plot(x2, y2, color="black", linewidth=2.2, label=fr"mean over top {TOPK_MEAN}")
+        ax2.plot(x2, 1-np.sqrt(y2), color="black", linewidth=2.2, label=fr"mean over top {TOPK_MEAN}")
+        ax2.set_yscale("log")
 
         if plot_th_tr:
             for i in range(1, TOPK_MEAN + 1):
