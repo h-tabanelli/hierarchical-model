@@ -259,14 +259,22 @@ def plot_one_exp(exp_id: str, label: str):
             ax.axvline(alpha_th, color=col, linestyle="dashed", linewidth=0.8, alpha=0.7)
 
     if gamma > 1/2:
-        ax.plot(x, np.exp((-1+1/(2*gamma + 1e-3))*(x-2)*np.log(d) + 0.1), color='k', linestyle="dashed", label=r"rate: $(-1+1/(2*\gamma))*\log (d)$")
-        ax.plot(x, np.exp((-1+1/(2*gamma + 1e-3))*(x-2) + 0.1), color='k', label=r"rate: $-1+1/(2*\gamma)$")
+        # ax.plot(x, np.exp((-1+1/(2*gamma + 1e-3))*(x-2)*np.log(d) + 0.1), color='k', linestyle="dashed", label=r"rate: $(-1+1/(2*\gamma))*\log (d)$")
+        # ax.plot(x, np.exp((-1+1/(2*gamma + 1e-3))*(x-2) + 0.1), color='k', label=r"rate: $-1+1/(2*\gamma)$")
+        ax.plot(x, np.exp((-1/2)*(x-2) + 0.1), color='r', label=r"rate: $-1/2$")
+        ax.plot(x, np.exp((-1/2)*(x-2)*np.log(d) + 0.1), color='r', linestyle="dashed", label=r"rate: $(-1/2)*\log (d)$")
+        ax.plot(x, np.exp((-1)*(x-2) + 0.1), color='g', label=r"rate: $-1$")
+        ax.plot(x, np.exp((-1)*(x-2)*np.log(d) + 0.1), color='g', linestyle="dashed", label=r"rate: $(-1)*\log (d)$")
     elif gamma <= 1/2: 
         ax.plot(x, np.exp((1-1/(2*gamma + 1e-3))*(x-2)*np.log(d) + 0.1), color='r', linestyle="dashed", label=r"rate: $(1-1/(2*\gamma))*\log (d)$")
         ax.plot(x, np.exp((1-1/(2*gamma + 1e-3))*(x-2) + 0.1), color='r', label=r"rate: $(1-1/(2*\gamma))$")
+        ax.plot(x, np.exp((-1/2)*(x-2) + 0.1), color='k', label=r"rate: $-1/2$")
+        ax.plot(x, np.exp((-1/2)*(x-2)*np.log(d) + 0.1), color='k', linestyle="dashed", label=r"rate: $(-1/2)*\log (d)$")
+        ax.plot(x, np.exp((-1)*(x-2) + 0.1), color='g', label=r"rate: $-1$")
+        ax.plot(x, np.exp((-1)*(x-2)*np.log(d) + 0.1), color='g', linestyle="dashed", label=r"rate: $(-1)*\log (d)$")
 
     ax.set_xlabel(r"$\alpha=\log(n)/\log(d)$")
-    ax.set_ylabel(r"$\cos^2(\theta_i)$  (principal angles)")
+    ax.set_ylabel(r"$1-\|\cos(\theta_i)\|$  (principal angles)")
     ax.set_yscale("log")
     ax.set_ylim(1e-4, 1.01)
     ax.grid(True, alpha=GRID_ALPHA)

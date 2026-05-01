@@ -420,6 +420,8 @@ def _apply_rf_activation(U: torch.Tensor, rf_activation: str):
     # plain linear
     if rf_activation in {"id", "identity", "linear"}:
         return U
+    if rf_activation in {"tanh_sq", "tanh_x2", "tanh_u2"}:
+        return torch.tanh(U * U)
     # raw ReLU: keeps order 0 and order 1
     if rf_activation in {"relu_raw", "relu_uncentered", "relu_plain"}:
         return torch.relu(U)
@@ -891,6 +893,7 @@ def fit_rf_vector_affine_removed_head_from_H_stream(
     rf_seed: int = 0,
     device=None,
     ridge: float = 1e-6,
+    debug_print: bool = False,
 ):
     """
     Exact vector-valued affine removal in RF2 space.
@@ -933,6 +936,7 @@ def fit_rf_vector_affine_removed_head_from_H_stream(
     sum_uu = torch.zeros((m, m), dtype=torch.float64, device="cpu")
     sum_su = torch.zeros((m, m), dtype=torch.float64, device="cpu")
     n_seen = 0
+    sum_ss = 0.0
 
     # ---------- pass 1: fit affine vector regression S ≈ a + U B^T ----------
     for H, _ in stream_fn_factory()():
@@ -949,6 +953,8 @@ def fit_rf_vector_affine_removed_head_from_H_stream(
         sum_su += Sc.T @ Uc
         n_seen += int(H.shape[0])
 
+        sum_ss += float((Sc * Sc).sum().item())
+
     denom_n = float(int(n_total) if int(n_total) > 0 else n_seen)
 
     m_u = sum_u / denom_n                           # (m,)
@@ -959,6 +965,15 @@ def fit_rf_vector_affine_removed_head_from_H_stream(
     C_uu = M_uu - torch.outer(m_u, m_u)            # (m,m)
     C_su = M_su - torch.outer(m_s, m_u)            # (m,m)
 
+    if debug_print:
+        evals = torch.linalg.eigvalsh(C_uu)
+        topk = evals[-min(10, evals.numel()):].flip(0)
+        print("[RF2DBG] ||m_u|| =", float(torch.linalg.norm(m_u)))
+        print("[RF2DBG] ||m_s|| =", float(torch.linalg.norm(m_s)))
+        print("[RF2DBG] top eigs(C_uu) =", [float(x) for x in topk])
+        print("[RF2DBG] trace(C_uu) =", float(torch.trace(C_uu)))
+        print("[RF2DBG] ||C_su||_F =", float(torch.linalg.norm(C_su)))
+
     A = C_uu + float(ridge) * torch.eye(m, dtype=torch.float64, device="cpu")
 
     # We want B = C_su (C_uu + ridge I)^(-1)
@@ -968,8 +983,24 @@ def fit_rf_vector_affine_removed_head_from_H_stream(
 
     a_aff = (m_s - B_aff @ m_u).contiguous()       # (m,)
 
+    if debug_print:
+        print("[RF2DBG] ridge =", float(ridge))
+        print("[RF2DBG] ||B_aff||_F =", float(torch.linalg.norm(B_aff)))
+        print("[RF2DBG] ||a_aff|| =", float(torch.linalg.norm(a_aff)))
+
     # ---------- pass 2: build ahat = (1/n) sum y R ----------
     ahat = torch.zeros(m, dtype=torch.float64, device="cpu")
+
+    sum_R = torch.zeros(m, dtype=torch.float64, device="cpu")
+    sum_RU = torch.zeros((m, m), dtype=torch.float64, device="cpu")
+    sum_R2 = 0.0
+    sum_Sc2 = 0.0
+
+    sum_h2 = 0.0
+    sum_h22 = 0.0
+    sum_y = 0.0
+    sum_y2 = 0.0
+    sum_h2y = 0.0
 
     B_aff_f32 = B_aff.to(dtype=torch.float32, device=device)
     a_aff_f32 = a_aff.to(dtype=torch.float32, device=device)
@@ -982,9 +1013,89 @@ def fit_rf_vector_affine_removed_head_from_H_stream(
         S = _apply_rf_activation(U, str(rf_activation))
         R = S - a_aff_f32[None, :] - U @ B_aff_f32.T
 
+        if debug_print:
+            Uc = U.detach().to(device="cpu", dtype=torch.float64)
+            Sc = S.detach().to(device="cpu", dtype=torch.float64)
+            Rc = R.detach().to(device="cpu", dtype=torch.float64)
+            yc = y.detach().to(device="cpu", dtype=torch.float64)
+
+            sum_R += Rc.sum(dim=0)
+            sum_RU += Rc.T @ Uc
+            sum_R2 += float((Rc * Rc).sum().item())
+            Sc_centered = Sc - m_s[None, :]
+            sum_Sc2 += float((Sc_centered * Sc_centered).sum().item())
+
         ahat += (R.T @ y).detach().to(device="cpu", dtype=torch.float64)
 
+        if debug_print:
+            h2_batch = (R @ ahat.to(device=R.device, dtype=R.dtype)).detach().to(device="cpu", dtype=torch.float64)
+            sum_h2 += float(h2_batch.sum().item())
+            sum_h22 += float((h2_batch * h2_batch).sum().item())
+            sum_y += float(yc.sum().item())
+            sum_y2 += float((yc * yc).sum().item())
+            sum_h2y += float((h2_batch * yc).sum().item())
+
     ahat /= denom_n
+
+    if debug_print:
+        mean_R = sum_R / denom_n
+        mean_RU = sum_RU / denom_n
+
+        eta = sum_R2 / max(sum_Sc2, 1e-12)
+
+        mean_h2 = sum_h2 / denom_n
+        mean_yv = sum_y / denom_n
+        var_h2 = max(sum_h22 / denom_n - mean_h2 * mean_h2, 0.0)
+        var_yv = max(sum_y2 / denom_n - mean_yv * mean_yv, 0.0)
+        cov_h2y = sum_h2y / denom_n - mean_h2 * mean_yv
+        corr_h2y = cov_h2y / max((var_h2 * var_yv) ** 0.5, 1e-12)
+
+        print("[RF2DBG] ||E[R]|| =", float(torch.linalg.norm(mean_R)))
+        print("[RF2DBG] ||E[R U^T]||_F =", float(torch.linalg.norm(mean_RU)))
+        print("[RF2DBG] energy ratio eta = E||R||^2 / E||S-ES||^2 =", float(eta))
+        print("[RF2DBG] ||ahat|| =", float(torch.linalg.norm(ahat)))
+        print("[RF2DBG] train corr(h2,y) =", float(corr_h2y))
+        print("[RF2DBG] std(h2) =", float(var_h2 ** 0.5))
+
+    if debug_print:
+        sum_h2 = 0.0
+        sum_h22 = 0.0
+        sum_y = 0.0
+        sum_y2 = 0.0
+        sum_h2y = 0.0
+
+        B_aff_f32 = B_aff.to(dtype=torch.float32, device=device)
+        a_aff_f32 = a_aff.to(dtype=torch.float32, device=device)
+        ahat_f32 = ahat.to(dtype=torch.float32, device=device)
+
+        for H, y in stream_fn_factory()():
+            H = H.to(device=device, dtype=torch.float32)
+            y = y.to(device=device, dtype=torch.float32).reshape(-1)
+
+            U = H @ W.T
+            S = _apply_rf_activation(U, str(rf_activation))
+            R = S - a_aff_f32[None, :] - U @ B_aff_f32.T
+            h2 = R @ ahat_f32
+
+            hc = h2.detach().to(device="cpu", dtype=torch.float64)
+            yc = y.detach().to(device="cpu", dtype=torch.float64)
+
+            sum_h2 += float(hc.sum().item())
+            sum_h22 += float((hc * hc).sum().item())
+            sum_y += float(yc.sum().item())
+            sum_y2 += float((yc * yc).sum().item())
+            sum_h2y += float((hc * yc).sum().item())
+
+        mean_h2 = sum_h2 / denom_n
+        mean_yv = sum_y / denom_n
+        var_h2 = max(sum_h22 / denom_n - mean_h2 * mean_h2, 0.0)
+        var_yv = max(sum_y2 / denom_n - mean_yv * mean_yv, 0.0)
+        cov_h2y = sum_h2y / denom_n - mean_h2 * mean_yv
+        corr_h2y = cov_h2y / max((var_h2 * var_yv) ** 0.5, 1e-12)
+
+        print("[RF2DBG] FINAL ||ahat|| =", float(torch.linalg.norm(ahat)))
+        print("[RF2DBG] FINAL std(h2) =", float(var_h2 ** 0.5))
+        print("[RF2DBG] FINAL corr(h2,y) =", float(corr_h2y))
 
     return (
         rf_layer,
@@ -1048,6 +1159,131 @@ def compute_h2hat_from_H_and_rf_vector_affine_removed_linear_head(
     )
     a = ahat.to(device=R.device, dtype=R.dtype).reshape(-1)
     return R @ a
+
+@torch.no_grad()
+def fit_rf_quadratic_top_eig_from_H_stream(
+    stream_fn_factory,
+    d_in: int,
+    rf_width: int,
+    n_total: int,
+    rf_activation: str = "relu_raw",
+    rf_seed: int = 0,
+    device=None,
+    debug_print: bool = False,
+):
+    """
+    RF2 quadratic top-eigenvector estimator.
+
+    For each sample:
+        H    : (bs, d_in)
+        U    = H W^T              in R^{bs x rf_width}
+        S    = sigma(U)           in R^{bs x rf_width}
+        Phi  = S - mean(S)
+
+    Build:
+        M = (1/n) sum_mu y_mu * Phi_mu Phi_mu^T
+
+    Then take the top eigenvector v of M (largest absolute eigenvalue).
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    rf_layer = init_rf_layer(
+        d=int(d_in),
+        rf_width=int(rf_width),
+        rf_activation=str(rf_activation),
+        seed=int(rf_seed),
+        device=device,
+        dtype=torch.float32,
+    )
+
+    W = rf_layer["W"].to(device=device, dtype=torch.float32)
+    m = int(rf_width)
+
+    # ---------- pass 1: mean activation ----------
+    sum_s = torch.zeros(m, dtype=torch.float64, device="cpu")
+    n_seen = 0
+
+    for H, _ in stream_fn_factory()():
+        H = H.to(device=device, dtype=torch.float32)
+        U = H @ W.T
+        S = _apply_rf_activation(U, str(rf_activation))
+
+        sum_s += S.detach().to(device="cpu", dtype=torch.float64).sum(dim=0)
+        n_seen += int(H.shape[0])
+
+    denom_n = float(int(n_total) if int(n_total) > 0 else n_seen)
+    s_mean = (sum_s / denom_n).contiguous()   # (m,)
+
+    # ---------- pass 2: quadratic matrix ----------
+    M = torch.zeros((m, m), dtype=torch.float64, device="cpu")
+    s_mean_f32 = s_mean.to(device=device, dtype=torch.float32)
+
+    for H, y in stream_fn_factory()():
+        H = H.to(device=device, dtype=torch.float32)
+        y = y.to(device=device, dtype=torch.float32).reshape(-1)
+
+        U = H @ W.T
+        S = _apply_rf_activation(U, str(rf_activation))
+        Phi = S - s_mean_f32[None, :]                      # (bs, m)
+
+        # sum_mu y_mu * phi_mu phi_mu^T
+        M += (Phi.T @ (Phi * y[:, None])).detach().to(device="cpu", dtype=torch.float64)
+
+    M /= denom_n
+    M = 0.5 * (M + M.T)
+
+    evals, evecs = torch.linalg.eigh(M)                   # ascending
+    idx = torch.argmax(torch.abs(evals))
+    top_eig = evals[idx].contiguous()                     # scalar
+    top_vec = evecs[:, idx].contiguous()                  # (m,)
+
+    if debug_print:
+        print("[RF2QDBG] ||mean_s|| =", float(torch.linalg.norm(s_mean)))
+        print("[RF2QDBG] trace(M) =", float(torch.trace(M)))
+        print("[RF2QDBG] top eig abs =", float(torch.abs(top_eig)))
+        print("[RF2QDBG] top eig =", float(top_eig))
+
+    return (
+        rf_layer,
+        s_mean.contiguous(),      # (m,)
+        top_vec.contiguous(),     # (m,)
+        top_eig.contiguous(),     # ()
+    )
+
+
+@torch.no_grad()
+def compute_h2hat_from_H_and_rf_quadratic_top(
+    H: torch.Tensor,
+    rf_head: dict,
+    s_mean: torch.Tensor,
+    top_vec: torch.Tensor,
+    device=None,
+    dtype=torch.float32,
+):
+    """
+    Test-time scalar feature:
+        u   = H W^T
+        s   = sigma(u)
+        phi = s - mean_s
+        h2  = (top_vec^T phi)^2
+    """
+    if device is None:
+        device = H.device
+
+    H = H.to(device=device, dtype=dtype)
+    W = rf_head["W"].to(device=device, dtype=dtype)
+
+    U = H @ W.T
+    S = _apply_rf_activation(U, str(rf_head["rf_activation"]))
+
+    mu = s_mean.to(device=device, dtype=dtype).reshape(1, -1)
+    v = top_vec.to(device=device, dtype=dtype).reshape(-1)
+
+    Phi = S - mu
+    proj = Phi @ v
+    return proj * proj
+
 
 @torch.no_grad()
 def estimate_Bhat_from_stream(stream_fn, Ahat, p, n_total, device=None, dtype=torch.float32):
@@ -1530,7 +1766,6 @@ def dense_spectrum_from_stream(
 
     # Accumulate dense matrix in float64 for numerical stability
     C = torch.zeros((dim, dim), device=device, dtype=torch.float64)
-    sum_y = torch.tensor(0.0, device=device, dtype=torch.float64)
 
     # Stream batches
     for Z, y in stream_fn_factory()():   # IMPORTANT: factory returns a function, then call it
@@ -1540,15 +1775,9 @@ def dense_spectrum_from_stream(
         # weighted Gram: Z^T diag(y) Z = ( (sqrt(|y|) Z)^T * sign(y) * (sqrt(|y|) Z) )
         # simplest: (Z.T @ (y[:,None] * Z))
         C += (Z.to(torch.float64).T @ ((y[:, None]).to(torch.float64) * Z.to(torch.float64)))
-        sum_y += y.to(torch.float64).sum()
 
     C /= float(n_total)
-    mean_y = sum_y / float(n_total)
 
-    # subtract mean_y * I  because (1/n) sum y * (-I)
-    C -= mean_y * torch.eye(dim, device=device, dtype=torch.float64)
-
-    # Optional: recentre le bulk (souvent utile pour lisibilité)
     if center:
         C -= (torch.trace(C) / dim) * torch.eye(dim, device=device, dtype=torch.float64)
 

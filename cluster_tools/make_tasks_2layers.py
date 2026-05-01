@@ -94,7 +94,7 @@ def main() -> None:
         "--head_mode",
         type=str,
         default="spectral_B",
-        choices=["spectral_B", "latent_rbf", "input_rbf", "latent_poly2", "input_poly4_rf", "latent_rf_spectral"],
+        choices=["spectral_B", "latent_rbf", "input_rbf", "latent_poly2", "input_poly4_rf", "latent_rf_spectral", "latent_rf_quad_top"],
     )
     ap.add_argument("--n_krr_max", type=int, default=4000)
     ap.add_argument("--rbf_lambda", type=float, default=1e-4)

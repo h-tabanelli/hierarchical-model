@@ -117,6 +117,8 @@ def get_activation_fn(g_name=None, g_callable=None):
         return g_callable
     if g_name is None or g_name == 'id':
         return lambda x: x
+    elif g_name == "x2_plus_x_minus1":
+        return lambda z: z**2 + z - 1.0
     if g_name == 'tanh':
         return lambda x: x.tanh()
     if g_name == 'relu_centered':

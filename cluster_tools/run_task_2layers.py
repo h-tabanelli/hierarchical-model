@@ -169,6 +169,10 @@ def _run_one_alpha_model(
     rf2_affine_B = None
     ahat_rf2 = None
 
+    rf2_mean_s = None
+    rf2_topvec = None
+    rf2_topeig = None
+
     whiten_mu = None
     whiten_cov = None
     whiten_mat = None
@@ -177,7 +181,7 @@ def _run_one_alpha_model(
     is_id = (g_name is None) or (g_name == "id")
 
     head_mode = str(head_mode)
-    if head_mode not in {"spectral_B", "latent_rbf", "input_rbf", "latent_poly2", "input_poly4_rf", "latent_rf_spectral"}:
+    if head_mode not in {"spectral_B", "latent_rbf", "input_rbf", "latent_poly2", "input_poly4_rf", "latent_rf_spectral", "latent_rf_quad_top"}:
         raise ValueError(f"Unknown head_mode: {head_mode}")
 
     layer1_mode = str(layer1_mode)
@@ -299,6 +303,53 @@ def _run_one_alpha_model(
                 return_info=True,
             )
             info["loaded_Ahat"] = False
+
+    if layer1_mode == "rf_spectral":
+        # quick RF1 diagnostics on test Gaussian cloud Xte
+        S_dbg = estimators.apply_rf_layer(
+            Xte.to(device=device, dtype=torch.float32),
+            rf_layer=rf_layer,
+            device=device,
+            dtype=torch.float32,
+        )
+        H_dbg = estimators.compute_hhat_from_X_and_rf(
+            Xte.to(device=device, dtype=torch.float32),
+            rf_layer=rf_layer,
+            Vhat=Vhat,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        U_dbg = Xte.to(device=device, dtype=torch.float32) @ rf_layer["W"].to(device=device, dtype=torch.float32).T
+        print("[RF1LIVE] W1x mean avg/min/max =",
+              float(U_dbg.mean(dim=0).mean().item()),
+              float(U_dbg.mean(dim=0).min().item()),
+              float(U_dbg.mean(dim=0).max().item()))
+        print("[RF1LIVE] W1x var avg/min/max =",
+              float(U_dbg.var(dim=0, unbiased=False).mean().item()),
+              float(U_dbg.var(dim=0, unbiased=False).min().item()),
+              float(U_dbg.var(dim=0, unbiased=False).max().item()))
+
+        print("[RF1LIVE] ||mean sigma(W1 x)|| =", float(S_dbg.mean(dim=0).norm().item()))
+        print("[RF1LIVE] sigma(W1 x) std avg/min/max =",
+              float(S_dbg.std(dim=0).mean().item()),
+              float(S_dbg.std(dim=0).min().item()),
+              float(S_dbg.std(dim=0).max().item()))
+        print("[RF1LIVE] mean hhat =", [float(x) for x in H_dbg.mean(dim=0)])
+        print("[RF1LIVE] std hhat  =", [float(x) for x in H_dbg.std(dim=0)])
+
+        def _rf_stream_dbg():
+            for Xb, yb in stream_fn_factory()():
+                Xb = Xb.to(device=device, dtype=torch.float32)
+                yb = yb.to(device=device, dtype=torch.float32)
+                Sb = estimators.apply_rf_layer(Xb, rf_layer=rf_layer, device=device, dtype=torch.float32)
+                yield Sb, yb
+
+        CQ_dbg = estimators.C_apply_vec(_rf_stream_dbg, Vhat, m=rf_width, n_total=n, device=device)
+        Rsmall = (Vhat.to(torch.float64) @ CQ_dbg.to(torch.float64).T)
+        Rsmall = 0.5 * (Rsmall + Rsmall.T)
+        evals_small = torch.linalg.eigvalsh(Rsmall).flip(0)
+        print("[RF1LIVE] selected Ritz eigs =", [float(x) for x in evals_small])
 
     # ---- Step 2: fit the head ----
     Bhat_cpu = None
@@ -598,7 +649,8 @@ def _run_one_alpha_model(
                 rf_activation=rf2_activation,
                 rf_seed=seed + 424242,
                 device=device,
-                ridge=1e-6,
+                ridge=rf2_affine_ridge,
+                debug_print=False,
             )
         )
 
@@ -651,6 +703,70 @@ def _run_one_alpha_model(
                 device=device,
             )
 
+    elif head_mode == "latent_rf_quad_top":
+        Hhat_stream_factory = _make_Hhat_stream_factory(use_whiten_for_rf2=False)
+
+        rf2_layer, rf2_mean_s, rf2_topvec, rf2_topeig = (
+            estimators.fit_rf_quadratic_top_eig_from_H_stream(
+                stream_fn_factory=Hhat_stream_factory,
+                d_in=p,
+                rf_width=rf2_width,
+                n_total=n,
+                rf_activation=rf2_activation,
+                rf_seed=seed + 424242,
+                device=device,
+                debug_print=False,
+            )
+        )
+
+        h2_chunks = []
+        y_chunks = []
+        n_keep_h2 = None if int(n_krr_max) <= 0 else min(int(n), int(n_krr_max))
+        kept_h2 = 0
+
+        for H_batch, y_batch in Hhat_stream_factory()():
+            h2_batch = estimators.compute_h2hat_from_H_and_rf_quadratic_top(
+                H_batch.to(device=device, dtype=torch.float32),
+                rf_head=rf2_layer,
+                s_mean=rf2_mean_s,
+                top_vec=rf2_topvec,
+                device=device,
+            ).reshape(-1, 1)
+
+            if n_keep_h2 is None:
+                h2_chunks.append(h2_batch.detach().cpu())
+                y_chunks.append(y_batch.detach().cpu())
+                continue
+
+            take = min(h2_batch.shape[0], n_keep_h2 - kept_h2)
+            if take <= 0:
+                break
+
+            h2_chunks.append(h2_batch[:take].detach().cpu())
+            y_chunks.append(y_batch[:take].detach().cpu())
+            kept_h2 += take
+
+            if kept_h2 >= n_keep_h2:
+                break
+
+        H2_train = torch.cat(h2_chunks, dim=0).to(torch.float32)
+        y2_train = torch.cat(y_chunks, dim=0).to(torch.float32).reshape(-1)
+
+        if is_id:
+            if calibrate_output:
+                affine_a, affine_b = estimators.fit_affine_link(
+                    H2_train[:, 0].numpy(), y2_train.numpy()
+                )
+        else:
+            rbf_model = estimators.fit_rbf_krr(
+                H2_train,
+                y2_train,
+                sigma=None,
+                lam=rbf_lambda,
+                sigma_mult=rbf_sigma_mult,
+                device=device,
+            )
+    
     elif head_mode == "latent_poly2":
         if not needs_Ahat:
             raise ValueError(f"{head_mode} currently requires layer1_mode='hermite_spectral'.")
@@ -794,10 +910,12 @@ def _run_one_alpha_model(
             "rf2_affine_B": None if rf2_affine_B is None else rf2_affine_B.detach().to(device="cpu", dtype=torch.float16),
             "ahat_rf2": None if ahat_rf2 is None else ahat_rf2.detach().to(device="cpu", dtype=torch.float16),
 
+            "rf2_mean_s": None if rf2_mean_s is None else rf2_mean_s.detach().to(device="cpu", dtype=torch.float16),
+            "rf2_topvec": None if rf2_topvec is None else rf2_topvec.detach().to(device="cpu", dtype=torch.float16),
+            "rf2_topeig": None if rf2_topeig is None else float(rf2_topeig),
+
             "Bhat": None if Bhat_cpu is None else Bhat_cpu.detach().to(device="cpu", dtype=torch.float16),
             "ahat_rf2": None if ahat_rf2 is None else ahat_rf2.detach().to(device="cpu", dtype=torch.float16),
-            "Wrf2": None if rf2_layer is None else rf2_layer["W"].detach().to(device="cpu", dtype=torch.float16),
-            "rf2_activation": None if rf2_layer is None else str(rf2_layer["rf_activation"]),
 
             "whiten_mu": None if whiten_mu is None else whiten_mu.detach().to(device="cpu", dtype=torch.float32),
             "whiten_mat": None if whiten_mat is None else whiten_mat.detach().to(device="cpu", dtype=torch.float32),
@@ -838,6 +956,16 @@ def _run_one_alpha_model(
             a_aff=rf2_affine_a,
             B_aff=rf2_affine_B,
             ahat=ahat_rf2,
+            device=device,
+        )
+        corr_s = float(mps.corr_second_layer_scalar(h2_test, ste_true))
+
+    if head_mode == "latent_rf_quad_top" and Hte_hat is not None:
+        h2_test = estimators.compute_h2hat_from_H_and_rf_quadratic_top(
+            Hte_hat,
+            rf_head=rf2_layer,
+            s_mean=rf2_mean_s,
+            top_vec=rf2_topvec,
             device=device,
         )
         corr_s = float(mps.corr_second_layer_scalar(h2_test, ste_true))
@@ -899,6 +1027,28 @@ def _run_one_alpha_model(
             a_aff=rf2_affine_a,
             B_aff=rf2_affine_B,
             ahat=ahat_rf2,
+            device=device,
+        ).detach().cpu().reshape(-1, 1)
+
+        eig_err_B = None
+        eig_corr_B = None
+        c_opt_B = None
+
+        if is_id:
+            s_test = h2_test[:, 0].numpy()
+            if calibrate_output and affine_a is not None and affine_b is not None:
+                yhat = estimators.predict_affine_link(s_test, affine_a, affine_b)
+            else:
+                yhat = s_test
+        else:
+            yhat = estimators.predict_rbf_krr(rbf_model, h2_test, device=device).numpy()
+
+    elif head_mode == "latent_rf_quad_top":
+        h2_test = estimators.compute_h2hat_from_H_and_rf_quadratic_top(
+            Hte_hat,
+            rf_head=rf2_layer,
+            s_mean=rf2_mean_s,
+            top_vec=rf2_topvec,
             device=device,
         ).detach().cpu().reshape(-1, 1)
 
