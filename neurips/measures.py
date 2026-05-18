@@ -9,7 +9,7 @@ import os, json, time
 def subspace_overlap_frob(Ahat, Atrue):
     """
     Ahat: (p,d,d) orthonormal Frobenius
-    Atrue:(p,d,d) orthonormal Frobenius (ou au moins span comparable)
+    Atrue:(p,d,d) orthonormal Frobenius (or at least comparable span)
     returns: overlap in [0,1] = (1/p) || Ahat_flat^T Atrue_flat ||_F^2
     """
     p,d,_ = Ahat.shape
@@ -232,7 +232,7 @@ def savefig(path):
 
 def plot_hist_flat(H, title, path, bins=80):
     """
-    Histogramme des entries H_{mu,i} aplaties.
+    Histogram of flattened H_{mu,i} entries.
     """
     import matplotlib.pyplot as plt
     z = np.asarray(H).reshape(-1)
@@ -259,7 +259,7 @@ def plot_cov_diag(H, title, path):
 def plot_cov_spectrum(H, title, path):
     import matplotlib.pyplot as plt
     """
-    Spectre de la covariance empirique de H.
+    Spectrum of the empirical covariance of H.
     """
     H = np.asarray(H)
     Hc = H - H.mean(axis=0, keepdims=True)
@@ -284,11 +284,11 @@ def save_npz(path, **arrays):
 # From curve to histogram 
 
 def hist_from_density(grid, density, bins=80):
-    # bins uniformes sur l’intervalle couvert par grid
+    # uniform bins over the range covered by grid
     edges = np.linspace(grid.min(), grid.max(), bins+1)
     probs = np.zeros(bins)
 
-    # intégrale par bin via trapz sur les points du bin
+    # bin integral via trapz on the points within each bin
     for i in range(bins):
         a, b = edges[i], edges[i+1]
         mask = (grid >= a) & (grid < b)
@@ -297,7 +297,7 @@ def hist_from_density(grid, density, bins=80):
         else:
             probs[i] = 0.0
 
-    # convertir en "hauteur d'histogramme" (densité) : prob / largeur
+    # convert to histogram height (density): prob / bin width
     widths = edges[1:] - edges[:-1]
     heights = probs / widths
     centers = 0.5*(edges[1:] + edges[:-1])
@@ -309,9 +309,9 @@ def plot_density_and_hist(grid, density, title="", bins=80):
     centers, heights, edges = hist_from_density(grid, density, bins=bins)
 
     plt.figure(figsize=(7,4))
-    # histogramme style RMT
+    # RMT-style histogram
     plt.bar(centers, heights, width=(edges[1]-edges[0]), alpha=0.4, align='center', edgecolor='k', linewidth=0.3)
-    # courbe lisse par-dessus (optionnel)
+    # smooth curve overlay (optional)
     plt.plot(grid, density, linewidth=2)
     plt.title(title)
     plt.xlabel("eigenvalue")
@@ -338,9 +338,9 @@ def plot_full_spectrum_with_top(evals, title, path, k_top=40, bins=120):
     plt.figure(figsize=(7,4))
     plt.hist(evals, bins=bins, alpha=0.8)
 
-    # indices des k plus grandes |lambda|
+    # indices of the k largest |lambda|
     idx = np.argsort(np.abs(evals))[-k_top:]
-    top = np.sort(evals[idx])  # valeurs signées correspondantes, triées pour un plot propre
+    top = np.sort(evals[idx])  # signed values, sorted for a clean plot
 
     for v in top:
         plt.axvline(v, linewidth=0.2, linestyle='dashed')

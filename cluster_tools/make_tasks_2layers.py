@@ -110,9 +110,16 @@ def main() -> None:
     ap.add_argument("--rf2_width", type=int, default=4096)
     ap.add_argument("--rf2_activation", type=str, default="relu_raw")
     ap.add_argument("--rf2_affine_ridge", type=float, default=1e-6)
-    ap.add_argument("--rf2_use_whiten", action="store_true")
-    ap.add_argument("--no_rf2_use_whiten", dest="rf2_use_whiten", action="store_false")
-    ap.set_defaults(rf2_use_whiten=True)
+    ap.add_argument("--rf2_head_type", type=str, default="vector_affine",
+                    choices=["vector_affine", "simple"],
+                    help="RF2 head type: vector_affine (empirical 2-pass removal) or simple (one-pass, analytical activation like relu_l1).")
+    ap.add_argument("--rf2_whiten_mode", type=str, default="full",
+                    choices=["none", "component", "full"],
+                    help="Whitening mode for second-stage RF: none / component (coord-wise) / full (ZCA matrix)")
+    ap.add_argument("--rf_row_normalize_sphere", action="store_true", default=False,
+                    help="Row-normalize W1 to unit sphere (each row ||W1[j]||=1).")
+    ap.add_argument("--rf2_row_normalize_sphere", action="store_true", default=False,
+                    help="Row-normalize W2 to unit sphere (each row ||W2[j]||=1).")
 
     ap.add_argument("--calibrate_output", action="store_true")
     ap.add_argument("--no_calibrate_output", dest="calibrate_output", action="store_false")
@@ -165,6 +172,7 @@ def main() -> None:
                 "rf2_width": int(args.rf2_width),
                 "rf2_activation": str(args.rf2_activation),
                 "rf2_affine_ridge": float(args.rf2_affine_ridge),
+                "rf2_head_type": str(args.rf2_head_type),
                 "n_krr_max": int(args.n_krr_max),
                 "rbf_lambda": float(args.rbf_lambda),
                 "rbf_sigma_mult": float(args.rbf_sigma_mult),
@@ -173,6 +181,9 @@ def main() -> None:
                 "m_rf": int(args.m_rf),
                 "calibrate_output": bool(args.calibrate_output),
                 "load_ahat_exp_id": None if args.load_ahat_exp_id == "" else str(args.load_ahat_exp_id),
+                "rf_row_normalize_sphere": bool(args.rf_row_normalize_sphere),
+                "rf2_row_normalize_sphere": bool(args.rf2_row_normalize_sphere),
+                "rf2_whiten_mode": str(args.rf2_whiten_mode),
             }
             lines.append(json.dumps(task))
             chunk_id += 1

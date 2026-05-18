@@ -20,6 +20,7 @@ def run_2layers_spectra_per_alpha(
     do_tau=True,
     bins=120,
     do_sanity=True,
+    do_ge=True,
     n_test=2000,
     g_name=None,
     g_callable=None,
@@ -217,19 +218,23 @@ def run_2layers_spectra_per_alpha(
 
     # L1
     specs["L1_true"] = estimators.dense_spectrum_from_stream(stream_xtilde_true, dim=m, n_total=n, device=device)
-    specs["L1_ge"]   = estimators.dense_spectrum_from_stream(stream_xtilde_gauss, dim=m, n_total=n, device=device)
+    if do_ge:
+        specs["L1_ge"] = estimators.dense_spectrum_from_stream(stream_xtilde_gauss, dim=m, n_total=n, device=device)
 
     if do_tau:
         specs["L1_true_T"] = estimators.dense_spectrum_from_stream(wrap_tau(stream_xtilde_true), dim=m, n_total=n, device=device)
-        specs["L1_ge_T"]   = estimators.dense_spectrum_from_stream(wrap_tau(stream_xtilde_gauss), dim=m, n_total=n, device=device)
+        if do_ge:
+            specs["L1_ge_T"] = estimators.dense_spectrum_from_stream(wrap_tau(stream_xtilde_gauss), dim=m, n_total=n, device=device)
 
     # L2
     specs["L2_true"] = estimators.dense_spectrum_from_stream(stream_h_true, dim=p, n_total=n, device=device)
-    specs["L2_ge"]   = estimators.dense_spectrum_from_stream(stream_h_gauss, dim=p, n_total=n, device=device)
+    if do_ge:
+        specs["L2_ge"] = estimators.dense_spectrum_from_stream(stream_h_gauss, dim=p, n_total=n, device=device)
 
     if do_tau:
         specs["L2_true_T"] = estimators.dense_spectrum_from_stream(wrap_tau(stream_h_true), dim=p, n_total=n, device=device)
-        specs["L2_ge_T"]   = estimators.dense_spectrum_from_stream(wrap_tau(stream_h_gauss), dim=p, n_total=n, device=device)
+        if do_ge:
+            specs["L2_ge_T"] = estimators.dense_spectrum_from_stream(wrap_tau(stream_h_gauss), dim=p, n_total=n, device=device)
 
     # ========= NORMALIZE SPECS (extract arrays) =========
     specs_eigs = {}   # name -> 1D np.array of eigenvalues

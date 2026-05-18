@@ -1,0 +1,49 @@
+{
+  "task": {
+    "exp_id": "whitened",
+    "chunk_id": 0,
+    "d": 100,
+    "eps": 0.5,
+    "alphas": [
+      3.4
+    ],
+    "seed": 0,
+    "beta": 1.0,
+    "batch_size": 2048,
+    "n_test": 3000,
+    "A_mode_teacher": "sym_orth_frob",
+    "B_mode": "dense",
+    "gamma": 0.0,
+    "g_name": "id",
+    "models": [
+      "true"
+    ],
+    "head_mode": "latent_rf_spectral",
+    "layer1_mode": "rf_spectral",
+    "rf_width": 20000,
+    "rf_activation": "relu_l1",
+    "rf2_width": 512,
+    "rf2_activation": "relu_raw",
+    "rf2_affine_ridge": 1e-06,
+    "n_iter_C_max": 15,
+    "oversamp_C": 10,
+    "T_min": 0,
+    "stop_tol": null,
+    "fit_degree": 3,
+    "fit_ridge": 1e-06,
+    "n_krr_max": 3000,
+    "rbf_lambda": 0.0001,
+    "rbf_sigma_mult": 1.0,
+    "rbf_standardize": true,
+    "poly_lambda": 0.0001,
+    "m_rf": 256,
+    "calibrate_output": false,
+    "save_estimates": false,
+    "load_ahat_exp_id": null,
+    "rf_row_normalize_sphere": false,
+    "rf2_row_normalize_sphere": false,
+    "rf2_use_whiten": true
+  },
+  "started_utc": "2026-04-30T21:45:05Z",
+  "device": "cuda"
+}

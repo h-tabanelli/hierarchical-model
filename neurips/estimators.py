@@ -1576,7 +1576,7 @@ def dense_spectrum_from_stream(
     device=None,
     dtype=torch.float32,
     return_evecs=False,
-    center=True,          # centre le bulk en retirant trace/dim si tu veux (optionnel)
+    center=True,          # center the bulk by subtracting trace/dim (optional)
 ):
     """
     Build dense C = (1/n) sum y (z z^T - I) from stream, then compute full eigenspectrum.
@@ -1608,7 +1608,7 @@ def dense_spectrum_from_stream(
     # subtract mean_y * I  because (1/n) sum y * (-I)
     C -= mean_y * torch.eye(dim, device=device, dtype=torch.float64)
 
-    # Optional: recentre le bulk (souvent utile pour lisibilité)
+    # Optional: recenter the bulk (often improves readability)
     if center:
         C -= (torch.trace(C) / dim) * torch.eye(dim, device=device, dtype=torch.float64)
 
