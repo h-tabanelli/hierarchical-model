@@ -1,0 +1,19 @@
+{
+  "exp": "D400_eps05_g04_tanh_saveest",
+  "n_tasks": 30,
+  "n_expected_rows": 260,
+  "n_got_rows": 240,
+  "n_missing_rows": 20,
+  "missing_task_ids": [
+    2,
+    5,
+    8,
+    11,
+    14,
+    17,
+    20,
+    23,
+    26,
+    29
+  ]
+}

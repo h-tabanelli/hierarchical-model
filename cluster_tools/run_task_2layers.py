@@ -17,6 +17,8 @@ import sys
 import time
 from pathlib import Path
 import math
+import os
+import shutil
 
 import numpy as np
 import torch
@@ -54,6 +56,16 @@ def _load_done_pairs(metrics_path: Path) -> set[tuple[float, str]]:
                 continue
     return done
 
+def torch_save_safe(obj, final_path):
+    final_path = Path(final_path)
+    tmp_root = Path(os.environ.get("TMPDIR", "/tmp"))
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    tmp_path = tmp_root / (final_path.name + ".tmp")
+    try:
+        torch.save(obj, tmp_path)
+    except Exception:
+        torch.save(obj, tmp_path, _use_new_zipfile_serialization=False)
+    shutil.move(str(tmp_path), str(final_path))
 
 def _raw_pred_from_input(X_or_Z, Ahat, Bhat_cpu, model: str, device):
     """Same computation as in run_2layers_nmse.py."""
@@ -152,6 +164,7 @@ def _run_one_alpha_model(
     rf2_width: int = 4096,
     rf2_activation: str = "relu_raw",
     rf2_affine_ridge: float = 1e-6,
+    rf2_whiten_mode: str = "none",
     calibrate_output: bool,
 ) -> tuple[dict, torch.Tensor | None]:
     """Run a single (alpha, model) and return (metrics_dict, Q_full_for_warm_start)."""
@@ -176,9 +189,15 @@ def _run_one_alpha_model(
     whiten_mu = None
     whiten_cov = None
     whiten_mat = None
+    cw_mu = None
+    cw_std = None
 
     act = teacher.get_activation_fn(g_name=g_name, g_callable=None)
     is_id = (g_name is None) or (g_name == "id")
+
+    rf2_whiten_mode = str(rf2_whiten_mode).lower()
+    if rf2_whiten_mode not in {"none", "component", "full"}:
+        raise ValueError(f"Unknown rf2_whiten_mode: {rf2_whiten_mode}")
 
     head_mode = str(head_mode)
     if head_mode not in {"spectral_B", "latent_rbf", "input_rbf", "latent_poly2", "input_poly4_rf", "latent_rf_spectral", "latent_rf_quad_top"}:
@@ -370,45 +389,47 @@ def _run_one_alpha_model(
         calib_skip_batches = min(20, max(0, n_batches // 5))
         calib_take_batches = min(100, max(1, n_batches - calib_skip_batches))
 
-    def _make_Hhat_stream_factory(use_whiten_for_rf2: bool):
-        if needs_Ahat:
-            if model == "true":
-                def Hhat_stream():
+    def _make_Hhat_stream_factory(whiten_mode: str):
+        def Hhat_stream_raw():
+            if needs_Ahat:
+                if model == "true":
                     for X_or_Z, y_norm in stream_fn_factory()():
                         X_or_Z = X_or_Z.to(device=device, dtype=torch.float32)
                         Hhat = estimators.compute_hhat_from_X_and_Ahat(
                             X_or_Z, Ahat
                         ).to(device=device, dtype=torch.float32)
                         yield Hhat, y_norm
-                return lambda: Hhat_stream
-            else:
-                Ahat_flat_loc = teacher.flatten_A_sym_for_H2_feature(Ahat).to(device=device, dtype=torch.float32)
-
-                def Hhat_stream():
+                else:
+                    Ahat_flat_loc = teacher.flatten_A_sym_for_H2_feature(Ahat).to(
+                        device=device, dtype=torch.float32
+                    )
                     for X_or_Z, y_norm in stream_fn_factory()():
                         X_or_Z = X_or_Z.to(device=device, dtype=torch.float32)
                         Hhat = X_or_Z @ Ahat_flat_loc.T
                         yield Hhat, y_norm
-                return lambda: Hhat_stream
+            else:
+                for X_or_Z, y_norm in stream_fn_factory()():
+                    X_or_Z = X_or_Z.to(device=device, dtype=torch.float32)
+                    Hhat = estimators.compute_hhat_from_X_and_rf(
+                        X_or_Z, rf_layer=rf_layer, Vhat=Vhat, device=device
+                    )
+                    yield Hhat, y_norm
 
-        def Hhat_stream_raw():
-            for X_or_Z, y_norm in stream_fn_factory()():
-                X_or_Z = X_or_Z.to(device=device, dtype=torch.float32)
-                Hhat = estimators.compute_hhat_from_X_and_rf(
-                    X_or_Z, rf_layer=rf_layer, Vhat=Vhat, device=device
-                )
-                yield Hhat, y_norm
-
-        if use_whiten_for_rf2:
-            def Hhat_stream():
-                for Hraw, y_norm in Hhat_stream_raw():
+        def Hhat_stream():
+            for Hraw, y_norm in Hhat_stream_raw():
+                if whiten_mode == "full":
                     Hhat = estimators.apply_whitening_to_H(
                         Hraw, whiten_mu, whiten_mat, device=device
                     )
-                    yield Hhat, y_norm
-            return lambda: Hhat_stream
+                elif whiten_mode == "component":
+                    Hhat = estimators.apply_componentwise_whitening_to_H(
+                        Hraw, cw_mu, cw_std, device=device
+                    )
+                else:
+                    Hhat = Hraw
+                yield Hhat, y_norm
 
-        return lambda: Hhat_stream_raw
+        return lambda: Hhat_stream
 
     if head_mode == "spectral_B":
         if needs_Ahat:
@@ -636,9 +657,33 @@ def _run_one_alpha_model(
     #         )
 
     elif head_mode == "latent_rf_spectral":
+
+        def Hhat_stream_raw():
+            for X, y_norm in stream_fn_factory()():
+                X = X.to(device=device, dtype=torch.float32)
+                Hhat = estimators.compute_hhat_from_X_and_rf(
+                    X, rf_layer=rf_layer, Vhat=Vhat, device=device
+                )
+                yield Hhat, y_norm
+
+        if rf2_whiten_mode == "full":
+            whiten_mu, whiten_cov, whiten_mat = estimators.estimate_whitening_from_H_stream(
+                stream_fn=Hhat_stream_raw,
+                p=p,
+                device=device,
+                eps=1e-6,
+            )
+        elif rf2_whiten_mode == "component":
+            cw_mu, cw_std = estimators.estimate_componentwise_whitening_from_H_stream(
+                stream_fn=Hhat_stream_raw,
+                p=p,
+                device=device,
+                eps=1e-6,
+            )
+
         # Exact vector-valued affine removal in RF2 space.
         # No whitening before RF2 in this version.
-        Hhat_stream_factory = _make_Hhat_stream_factory(use_whiten_for_rf2=False)
+        Hhat_stream_factory = _make_Hhat_stream_factory(whiten_mode=rf2_whiten_mode)
 
         rf2_layer, rf2_affine_a, rf2_affine_B, ahat_rf2 = (
             estimators.fit_rf_vector_affine_removed_head_from_H_stream(
@@ -704,7 +749,7 @@ def _run_one_alpha_model(
             )
 
     elif head_mode == "latent_rf_quad_top":
-        Hhat_stream_factory = _make_Hhat_stream_factory(use_whiten_for_rf2=False)
+        Hhat_stream_factory = _make_Hhat_stream_factory(whiten_mode="none")
 
         rf2_layer, rf2_mean_s, rf2_topvec, rf2_topeig = (
             estimators.fit_rf_quadratic_top_eig_from_H_stream(
@@ -850,11 +895,18 @@ def _run_one_alpha_model(
                 device=device,
             ).to(device=device, dtype=torch.float32)
 
-            if whiten_mu is not None and whiten_mat is not None:
+            if rf2_whiten_mode == "full":
                 Hte_hat = estimators.apply_whitening_to_H(
                     Hte_hat_raw,
                     whiten_mu,
                     whiten_mat,
+                    device=device,
+                ).to(device=device, dtype=torch.float32)
+            elif rf2_whiten_mode == "component":
+                Hte_hat = estimators.apply_componentwise_whitening_to_H(
+                    Hte_hat_raw,
+                    cw_mu,
+                    cw_std,
                     device=device,
                 ).to(device=device, dtype=torch.float32)
             else:
@@ -921,13 +973,17 @@ def _run_one_alpha_model(
             "whiten_mat": None if whiten_mat is None else whiten_mat.detach().to(device="cpu", dtype=torch.float32),
             "whiten_cov": None if whiten_cov is None else whiten_cov.detach().to(device="cpu", dtype=torch.float32),
 
+            "rf2_whiten_mode": str(rf2_whiten_mode),
+            "cw_mu": None if cw_mu is None else cw_mu.detach().to(device="cpu", dtype=torch.float32),
+            "cw_std": None if cw_std is None else cw_std.detach().to(device="cpu", dtype=torch.float32),
+
             "affine_a": affine_a,
             "affine_b": affine_b,
 
             "poly_coeffs": None if coeffs is None else np.asarray(coeffs, dtype=np.float64),
             "poly_mu_sig": None if mu_sig is None else (float(mu_sig[0]), float(mu_sig[1])),
         }
-        torch.save(payload, artdir / "estimates.pt")
+        torch_save_safe(payload, artdir / "estimates.pt")
 
     s_te = teacher.compute_y_from_H_torch(Hte_true, B_teacher)
     yte_raw = act(s_te).detach().cpu().numpy()
@@ -1166,6 +1222,7 @@ def _run_one_alpha_model(
         "rf2_width": int(rf2_width),
         "rf2_activation": str(rf2_activation),
         "rf2_affine_ridge": float(rf2_affine_ridge),
+        "rf2_whiten_mode": str(rf2_whiten_mode),
         "batch_size": int(batch_size),
         "n_iter_C_max": int(n_iter_C_max),
         "n_iter_C_effective": int(info.get("n_iter_effective", n_iter_C_max)),
@@ -1268,6 +1325,7 @@ def main() -> None:
     rf2_width = int(task.get("rf2_width", 4096))
     rf2_activation = str(task.get("rf2_activation", "relu_raw"))
     rf2_affine_ridge = float(task.get("rf2_affine_ridge", 1e-6))
+    rf2_whiten_mode = str(task.get("rf2_whiten_mode", "none"))
 
     calibrate_output = bool(task.get("calibrate_output", False))
 
@@ -1337,12 +1395,13 @@ def main() -> None:
                     rf2_width=rf2_width,
                     rf2_activation=rf2_activation,
                     rf2_affine_ridge=rf2_affine_ridge,
+                    rf2_whiten_mode=rf2_whiten_mode,
                     calibrate_output=calibrate_output,
                 )
 
                 if Q_full is not None:
                     Q_state[model] = Q_full.detach()
-                    torch.save(Q_state[model], jobdir / f"Q_last_{model}.pt")
+                    torch_save_safe(Q_state[model], jobdir / f"Q_last_{model}.pt")
 
                 f.write(json.dumps(metrics) + "\n")
                 f.flush()

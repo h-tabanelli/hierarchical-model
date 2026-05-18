@@ -1,0 +1,19 @@
+{
+  "exp": "rf2cw_d120_tanh",
+  "n_tasks": 20,
+  "n_expected_rows": 530,
+  "n_got_rows": 520,
+  "n_missing_rows": 10,
+  "missing_task_ids": [
+    1,
+    3,
+    5,
+    7,
+    9,
+    11,
+    13,
+    15,
+    17,
+    19
+  ]
+}

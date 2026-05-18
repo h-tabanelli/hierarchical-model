@@ -541,7 +541,6 @@ def estimate_whitening_from_H_stream(
 
     return mu.detach().cpu(), Sigma.detach().cpu(), Winvhalf.detach().cpu()
 
-
 @torch.no_grad()
 def apply_whitening_to_H(
     H: torch.Tensor,
@@ -557,6 +556,65 @@ def apply_whitening_to_H(
     Wwhite = Wwhite_cpu.to(device=device, dtype=dtype)
     Hc = H - mu[None, :]
     return Hc @ Wwhite.T
+
+@torch.no_grad()
+def estimate_componentwise_whitening_from_H_stream(
+    stream_fn,
+    p: int,
+    device=None,
+    eps: float = 1e-6,
+):
+    """
+    Estimate per-coordinate mean/std for H:
+      mu_j = E[H_j]
+      std_j = sqrt(Var(H_j))
+    Returns CPU tensors: mu_cpu, std_cpu
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    h_sum = torch.zeros(p, device=device, dtype=torch.float32)
+    h_sq_sum = torch.zeros(p, device=device, dtype=torch.float32)
+    count = 0
+
+    for H, _ in stream_fn():
+        H = H.to(device=device, dtype=torch.float32)
+        h_sum += H.sum(dim=0)
+        h_sq_sum += (H * H).sum(dim=0)
+        count += H.shape[0]
+
+    if count == 0:
+        raise ValueError("estimate_componentwise_whitening_from_H_stream: empty stream")
+
+    mu = h_sum / float(count)
+    second_moment = h_sq_sum / float(count)
+    var = torch.clamp(second_moment - mu * mu, min=float(eps))
+    std = torch.sqrt(var)
+
+    return mu.detach().cpu(), std.detach().cpu()
+
+
+@torch.no_grad()
+def apply_componentwise_whitening_to_H(
+    H: torch.Tensor,
+    mu_cpu: torch.Tensor,
+    std_cpu: torch.Tensor,
+    device=None,
+    dtype=torch.float32,
+):
+    """
+    Component-wise whitening:
+      Hcw = (H - mu) / std
+    No rotation, no cross-coordinate mixing.
+    """
+    if device is None:
+        device = H.device
+
+    H = H.to(device=device, dtype=dtype)
+    mu = mu_cpu.to(device=device, dtype=dtype)
+    std = std_cpu.to(device=device, dtype=dtype)
+
+    return (H - mu[None, :]) / std[None, :]
 
 @torch.no_grad()
 def fit_rf_spectral_layer1_from_stream(

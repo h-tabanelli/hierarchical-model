@@ -1,0 +1,8 @@
+{
+  "exp": "rf2cw_d80_id",
+  "n_tasks": 20,
+  "n_expected_rows": 530,
+  "n_got_rows": 530,
+  "n_missing_rows": 0,
+  "missing_task_ids": []
+}

@@ -1,0 +1,8 @@
+{
+  "exp": "D400_eps05_g02_v2",
+  "n_tasks": 30,
+  "n_expected_rows": 260,
+  "n_got_rows": 260,
+  "n_missing_rows": 0,
+  "missing_task_ids": []
+}

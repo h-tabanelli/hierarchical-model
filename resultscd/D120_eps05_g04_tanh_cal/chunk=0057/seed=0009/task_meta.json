@@ -1,0 +1,51 @@
+{
+  "task": {
+    "exp_id": "D120_eps05_g04_tanh_cal",
+    "chunk_id": 57,
+    "d": 120,
+    "eps": 0.5,
+    "alphas": [
+      2.5,
+      2.6,
+      2.7,
+      2.8,
+      2.9
+    ],
+    "seed": 9,
+    "beta": 1.0,
+    "batch_size": 2048,
+    "n_test": 5000,
+    "A_mode_teacher": "sym_orth_frob",
+    "B_mode": "powerlaw_diag",
+    "gamma": 0.4,
+    "save_estimates": false,
+    "models": [
+      "true"
+    ],
+    "g_name": "tanh",
+    "n_iter_C_max": 15,
+    "oversamp_C": 10,
+    "T_min": 0,
+    "stop_tol": null,
+    "fit_degree": 5,
+    "fit_ridge": 1e-06,
+    "head_mode": "spectral_B",
+    "layer1_mode": "hermite_spectral",
+    "rf_width": 8192,
+    "rf_activation": "relu",
+    "rf2_width": 4096,
+    "rf2_activation": "relu_raw",
+    "rf2_affine_ridge": 1e-06,
+    "rf2_whiten_mode": "none",
+    "n_krr_max": 4000,
+    "rbf_lambda": 0.0001,
+    "rbf_sigma_mult": 1.0,
+    "rbf_standardize": true,
+    "poly_lambda": 0.0001,
+    "m_rf": 1024,
+    "calibrate_output": true,
+    "load_ahat_exp_id": null
+  },
+  "started_utc": "2026-05-05T20:17:49Z",
+  "device": "cuda"
+}

@@ -113,6 +113,12 @@ def main() -> None:
     ap.add_argument("--rf2_use_whiten", action="store_true")
     ap.add_argument("--no_rf2_use_whiten", dest="rf2_use_whiten", action="store_false")
     ap.set_defaults(rf2_use_whiten=True)
+    ap.add_argument(
+    "--rf2_whiten_mode",
+    type=str,
+    default="none",
+    choices=["none", "component", "full"],
+)
 
     ap.add_argument("--calibrate_output", action="store_true")
     ap.add_argument("--no_calibrate_output", dest="calibrate_output", action="store_false")
@@ -165,6 +171,7 @@ def main() -> None:
                 "rf2_width": int(args.rf2_width),
                 "rf2_activation": str(args.rf2_activation),
                 "rf2_affine_ridge": float(args.rf2_affine_ridge),
+                "rf2_whiten_mode": str(args.rf2_whiten_mode),
                 "n_krr_max": int(args.n_krr_max),
                 "rbf_lambda": float(args.rbf_lambda),
                 "rbf_sigma_mult": float(args.rbf_sigma_mult),

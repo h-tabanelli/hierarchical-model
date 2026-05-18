@@ -1,0 +1,29 @@
+{
+  "exp": "D800_eps05_g04_id_saveest",
+  "n_tasks": 30,
+  "n_expected_rows": 260,
+  "n_got_rows": 180,
+  "n_missing_rows": 80,
+  "missing_task_ids": [
+    1,
+    2,
+    4,
+    5,
+    7,
+    8,
+    10,
+    11,
+    13,
+    14,
+    16,
+    17,
+    19,
+    20,
+    22,
+    23,
+    25,
+    26,
+    28,
+    29
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "exp": "D120_eps05_g04",
+  "n_tasks": 120,
+  "n_expected_rows": 570,
+  "n_got_rows": 570,
+  "n_missing_rows": 0,
+  "missing_task_ids": []
+}
